@@ -364,7 +364,7 @@ export function applySubagentEvent(state: StatuslineState, event: unknown): bool
   const type = asString(e.type);
   if (!type) return false;
 
-  if (type === "session.created") {
+  if (type === "session.created" || type === "session.updated") {
     const child = extractCreatedChild(e);
     if (child) {
       const details = extractChildDetails(e);
