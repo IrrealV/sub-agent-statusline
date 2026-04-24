@@ -1,6 +1,6 @@
 # opencode-subagent-statusline
 
-![Subagents Monitor banner](./assets/subagents_monitor_banner.png)
+![Subagents Monitor banner](https://raw.githubusercontent.com/Joaquinvesapa/sub-agent-statusline/main/assets/subagents_monitor_banner.webp)
 
 **Subagent Monitor for OpenCode.**
 
@@ -28,11 +28,11 @@ When you delegate work to subagents, they can disappear into the background. Tha
 
 ## Screenshot
 
-![Subagent Monitor inside OpenCode](./assets/opencode_full.png)
+![Subagent Monitor inside OpenCode](https://raw.githubusercontent.com/Joaquinvesapa/sub-agent-statusline/main/assets/opencode_full.webp)
 
 Focused sidebar view:
 
-![Subagent Monitor sidebar](./assets/opencode_sidebar.png)
+![Subagent Monitor sidebar](https://raw.githubusercontent.com/Joaquinvesapa/sub-agent-statusline/main/assets/opencode_sidebar.webp)
 
 ---
 
