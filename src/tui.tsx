@@ -38,6 +38,8 @@ const HYDRATE_RETRY_MAX_DELAY_MS = 30_000;
 const HYDRATE_RETRY_MAX_ATTEMPTS = 6;
 const CLOCK_ICON = "";
 const TOKEN_ICON = "";
+const SUBAGENTS_EXPANDED_KV_KEY = "subagents.sidebar.expanded";
+const SUBAGENTS_SECTION_ENABLED_KV_KEY = "subagents.sidebar.enabled";
 
 type SidebarContentContext = TuiSlotContext & { session_id?: string };
 type HomeBottomContext = TuiSlotContext;
@@ -546,6 +548,8 @@ function SidebarSubagents(props: {
   sessionID: string;
   state: () => StatuslineState;
   nowMs: () => number;
+  expanded: () => boolean;
+  onToggleExpanded: () => void;
   sidebarWidth?: () => number | undefined;
   theme: TuiThemeCurrent;
 }) {
@@ -620,21 +624,27 @@ function SidebarSubagents(props: {
 
   return (
     <box flexDirection="column">
-      <text fg={props.theme.text}>Subagents</text>
+      <text
+        fg={props.theme.text}
+        selectable={false}
+        onMouseDown={props.onToggleExpanded}
+      >{`${props.expanded() ? "▾" : "▸"} Subagents`}</text>
       <AggregateBar />
 
-      <box flexDirection="column">
-        <For each={children()}>
-          {(child: ChildSessionState) => <ChildRow child={child} />}
-        </For>
-
-        <Show when={children().length === 0 && otherChildren().length > 0}>
-          <text fg={props.theme.textMuted}>Other sessions</text>
-          <For each={otherChildren()}>
+      <Show when={props.expanded()}>
+        <box flexDirection="column">
+          <For each={children()}>
             {(child: ChildSessionState) => <ChildRow child={child} />}
           </For>
-        </Show>
-      </box>
+
+          <Show when={children().length === 0 && otherChildren().length > 0}>
+            <text fg={props.theme.textMuted}>Other sessions</text>
+            <For each={otherChildren()}>
+              {(child: ChildSessionState) => <ChildRow child={child} />}
+            </For>
+          </Show>
+        </box>
+      </Show>
     </box>
   );
 }
@@ -972,9 +982,46 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const [hydrateRetryPendingSessions, setHydrateRetryPendingSessions] = createSignal<Set<string>>(new Set());
   const [hydrateRetryAttempts, setHydrateRetryAttempts] = createSignal<Map<string, number>>(new Map());
   const [hydrateRetryTick, setHydrateRetryTick] = createSignal(0);
+  const [subagentsExpanded, setSubagentsExpanded] = createSignal(
+    api.kv.get<boolean>(SUBAGENTS_EXPANDED_KV_KEY, true) !== false,
+  );
+  const [subagentsSectionEnabled, setSubagentsSectionEnabled] = createSignal(
+    api.kv.get<boolean>(SUBAGENTS_SECTION_ENABLED_KV_KEY, true) !== false,
+  );
   const hydrateRetryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
   let disposed = false;
   let previousRouteSessionID: string | undefined;
+
+  const setSubagentsExpandedPreference = (expanded: boolean): void => {
+    setSubagentsExpanded(expanded);
+    api.kv.set(SUBAGENTS_EXPANDED_KV_KEY, expanded);
+    api.ui.toast({
+      variant: "info",
+      message: expanded ? "Subagent list expanded" : "Subagent list collapsed",
+    });
+  };
+
+  const setSubagentsSectionEnabledPreference = (enabled: boolean): void => {
+    setSubagentsSectionEnabled(enabled);
+    api.kv.set(SUBAGENTS_SECTION_ENABLED_KV_KEY, enabled);
+    api.ui.toast({
+      variant: "info",
+      message: enabled ? "Subagent section enabled" : "Subagent section disabled",
+    });
+  };
+
+  const commandDispose = api.command.register(() => [
+    {
+      title: subagentsSectionEnabled()
+        ? "Subagents: Disable sidebar section"
+        : "Subagents: Enable sidebar section",
+      value: "subagent-statusline.toggle-sidebar-section",
+      description: "Toggle the entire subagent sidebar section",
+      category: "Subagents",
+      onSelect: () =>
+        setSubagentsSectionEnabledPreference(!subagentsSectionEnabled()),
+    },
+  ]);
 
   const clearHydrateRetryTimeout = (sessionID: string): void => {
     const timeout = hydrateRetryTimeouts.get(sessionID);
@@ -1162,6 +1209,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       clearTimeout(timeout);
     }
     hydrateRetryTimeouts.clear();
+    commandDispose();
     for (const dispose of disposers) {
       dispose();
     }
@@ -1184,13 +1232,19 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           childCount: Object.keys(state().children).length,
         });
         return (
-          <SidebarSubagents
-            sessionID={sessionID}
-            state={state}
-            nowMs={nowMs}
-            sidebarWidth={() => resolveSidebarWidth(ctx)}
-            theme={ctx.theme.current}
-          />
+          <Show when={subagentsSectionEnabled()}>
+            <SidebarSubagents
+              sessionID={sessionID}
+              state={state}
+              nowMs={nowMs}
+              expanded={subagentsExpanded}
+              onToggleExpanded={() =>
+                setSubagentsExpandedPreference(!subagentsExpanded())
+              }
+              sidebarWidth={() => resolveSidebarWidth(ctx)}
+              theme={ctx.theme.current}
+            />
+          </Show>
         );
       },
       home_bottom(ctx: HomeBottomContext) {
