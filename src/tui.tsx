@@ -34,6 +34,8 @@ const DONE_TOKEN_REHYDRATE_THROTTLE_MS = 2000;
 const DONE_TOKEN_REHYDRATE_MAX_ATTEMPTS = 15;
 const CLOCK_ICON = "";
 const TOKEN_ICON = "";
+const SUBAGENTS_EXPANDED_KV_KEY = "subagents.sidebar.expanded";
+const SUBAGENTS_SECTION_ENABLED_KV_KEY = "subagents.sidebar.enabled";
 
 type SidebarContentContext = TuiSlotContext & { session_id?: string };
 type HomeBottomContext = TuiSlotContext;
@@ -542,6 +544,8 @@ function SidebarSubagents(props: {
   sessionID: string;
   state: () => StatuslineState;
   nowMs: () => number;
+  expanded: () => boolean;
+  onToggleExpanded: () => void;
   sidebarWidth?: () => number | undefined;
   theme: TuiThemeCurrent;
 }) {
@@ -616,21 +620,27 @@ function SidebarSubagents(props: {
 
   return (
     <box flexDirection="column">
-      <text fg={props.theme.text}>Subagents</text>
+      <text
+        fg={props.theme.text}
+        selectable={false}
+        onMouseDown={props.onToggleExpanded}
+      >{`${props.expanded() ? "▾" : "▸"} Subagents`}</text>
       <AggregateBar />
 
-      <box flexDirection="column">
-        <For each={children()}>
-          {(child: ChildSessionState) => <ChildRow child={child} />}
-        </For>
-
-        <Show when={children().length === 0 && otherChildren().length > 0}>
-          <text fg={props.theme.textMuted}>Other sessions</text>
-          <For each={otherChildren()}>
+      <Show when={props.expanded()}>
+        <box flexDirection="column">
+          <For each={children()}>
             {(child: ChildSessionState) => <ChildRow child={child} />}
           </For>
-        </Show>
-      </box>
+
+          <Show when={children().length === 0 && otherChildren().length > 0}>
+            <text fg={props.theme.textMuted}>Other sessions</text>
+            <For each={otherChildren()}>
+              {(child: ChildSessionState) => <ChildRow child={child} />}
+            </For>
+          </Show>
+        </box>
+      </Show>
     </box>
   );
 }
@@ -664,6 +674,43 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const textPath = resolveTextPath(statePath);
   const [state, setState] = createSignal<StatuslineState>(createEmptyState());
   const [nowMs, setNowMs] = createSignal(Date.now());
+  const [subagentsExpanded, setSubagentsExpanded] = createSignal(
+    api.kv.get<boolean>(SUBAGENTS_EXPANDED_KV_KEY, true) !== false,
+  );
+  const [subagentsSectionEnabled, setSubagentsSectionEnabled] = createSignal(
+    api.kv.get<boolean>(SUBAGENTS_SECTION_ENABLED_KV_KEY, true) !== false,
+  );
+
+  const setSubagentsExpandedPreference = (expanded: boolean): void => {
+    setSubagentsExpanded(expanded);
+    api.kv.set(SUBAGENTS_EXPANDED_KV_KEY, expanded);
+    api.ui.toast({
+      variant: "info",
+      message: expanded ? "Subagent list expanded" : "Subagent list collapsed",
+    });
+  };
+
+  const setSubagentsSectionEnabledPreference = (enabled: boolean): void => {
+    setSubagentsSectionEnabled(enabled);
+    api.kv.set(SUBAGENTS_SECTION_ENABLED_KV_KEY, enabled);
+    api.ui.toast({
+      variant: "info",
+      message: enabled ? "Subagent section enabled" : "Subagent section disabled",
+    });
+  };
+
+  const commandDispose = api.command.register(() => [
+    {
+      title: subagentsSectionEnabled()
+        ? "Subagents: Disable sidebar section"
+        : "Subagents: Enable sidebar section",
+      value: "subagent-statusline.toggle-sidebar-section",
+      description: "Toggle the entire subagent sidebar section",
+      category: "Subagents",
+      onSelect: () =>
+        setSubagentsSectionEnabledPreference(!subagentsSectionEnabled()),
+    },
+  ]);
 
   const tick = setInterval(() => {
     setNowMs(Date.now());
@@ -709,6 +756,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   api.lifecycle.onDispose(() => {
     clearInterval(tick);
+    commandDispose();
     for (const dispose of disposers) {
       dispose();
     }
@@ -731,13 +779,19 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           childCount: Object.keys(state().children).length,
         });
         return (
-          <SidebarSubagents
-            sessionID={sessionID}
-            state={state}
-            nowMs={nowMs}
-            sidebarWidth={() => resolveSidebarWidth(ctx)}
-            theme={ctx.theme.current}
-          />
+          <Show when={subagentsSectionEnabled()}>
+            <SidebarSubagents
+              sessionID={sessionID}
+              state={state}
+              nowMs={nowMs}
+              expanded={subagentsExpanded}
+              onToggleExpanded={() =>
+                setSubagentsExpandedPreference(!subagentsExpanded())
+              }
+              sidebarWidth={() => resolveSidebarWidth(ctx)}
+              theme={ctx.theme.current}
+            />
+          </Show>
         );
       },
       home_bottom(ctx: HomeBottomContext) {
