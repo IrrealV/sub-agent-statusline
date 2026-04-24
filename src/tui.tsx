@@ -10,13 +10,14 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from
 import { writeFile } from "node:fs/promises";
 import os from "node:os";
 import { dirname, join } from "node:path";
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
 import type { Accessor } from "solid-js";
 import { applySubagentEvent, extractChildDetails } from "./events.js";
 import { byPriority, formatDuration, renderStatusLine } from "./render.js";
 import {
   createEmptyState,
   getCounts,
+  markChildStatus,
   resolveStatePath,
   resolveTextPath,
   saveState,
@@ -659,11 +660,282 @@ function HomeBottomStatus(props: {
   );
 }
 
+async function hydratePreviousSubagents(
+  api: TuiPluginApi,
+  currentSessionID: string,
+  statePath: string,
+  textPath: string,
+  setState: (fn: (prev: StatuslineState) => StatuslineState) => void,
+) : Promise<boolean> {
+  if (!currentSessionID) return false;
+
+  try {
+    const directory = api.state.path.directory;
+    const sessionClient = api.client.session;
+    let topLevelHydrationFailed = false;
+
+    const [childrenResp, messagesResp, statusResp] = await Promise.all([
+      (async () => {
+        const response = await safeReadAsync(() =>
+          sessionClient?.children?.({ sessionID: currentSessionID, directory }) ??
+            Promise.resolve({ data: [] }),
+        );
+        if (!response) topLevelHydrationFailed = true;
+        return response;
+      })(),
+      (async () => {
+        const response = await safeReadAsync(() =>
+          sessionClient?.messages?.({ sessionID: currentSessionID, directory }) ??
+            Promise.resolve({ data: [] }),
+        );
+        if (!response) topLevelHydrationFailed = true;
+        return response;
+      })(),
+      (async () => {
+        const response = await safeReadAsync(() =>
+          sessionClient?.status?.({ directory }) ?? Promise.resolve({ data: {} }),
+        );
+        if (!response) topLevelHydrationFailed = true;
+        return response;
+      })(),
+    ]);
+
+    const children = Array.isArray(childrenResp?.data) ? childrenResp.data : [];
+    const messages = Array.isArray(messagesResp?.data) ? messagesResp.data : [];
+    const allStatuses = asRecord(statusResp?.data) ?? {};
+    let childHydrationFailed = false;
+    const childMessageResults = await Promise.all(
+      children.map(async (child) => {
+        const session = asRecord(child);
+        const childID = typeof session?.id === "string" ? session.id : undefined;
+        if (!childID) {
+          return { childID: undefined, completedAt: undefined, hasError: false };
+        }
+        const childMessagesResp = await safeReadAsync(() =>
+          sessionClient?.messages?.({ sessionID: childID, directory }) ??
+            Promise.resolve({ data: [] }),
+        );
+        if (!childMessagesResp) {
+          childHydrationFailed = true;
+        }
+        const childMessages = Array.isArray(childMessagesResp?.data)
+          ? childMessagesResp.data
+          : [];
+        return { childID, ...summarizeAssistantMessages(childMessages) };
+      }),
+    );
+    const childErrors = new Set(
+      childMessageResults
+        .filter((result) => result.childID && result.hasError)
+        .map((result) => result.childID as string),
+    );
+    const childCompletedAt = new Map(
+      childMessageResults
+        .filter((result) => result.childID && result.completedAt)
+        .map((result) => [result.childID as string, result.completedAt as string]),
+    );
+
+    setState((current) => {
+      const next = cloneState(current);
+      let changed = false;
+
+      for (const rawSession of children) {
+        const session = asRecord(rawSession);
+        if (!session || typeof session.id !== "string") continue;
+        const fakeEvent = {
+          type: "session.created",
+          properties: {
+            sessionID: session.id,
+            info: session,
+          },
+        };
+        if (applySubagentEvent(next, fakeEvent)) changed = true;
+
+        const status = asRecord(allStatuses[session.id]);
+        const isBusy = status?.type === "busy";
+        const endedAt = childCompletedAt.get(session.id) ?? sessionTimestamp(session, "updated");
+        if (!isBusy && endedAt) {
+          const childStatus = childErrors.has(session.id) ? "error" : "done";
+          if (markChildStatus(next, session.id, childStatus, endedAt)) changed = true;
+        }
+      }
+
+      for (const rawMessage of messages) {
+        const message = asRecord(rawMessage);
+        const info = asRecord(message?.info);
+        const parts = Array.isArray(message?.parts) ? message.parts : [];
+        const parentMessageID = messageIDOf(message);
+        const isAssistant = info?.role === "assistant";
+        const time = asRecord(info?.time);
+        const eventInfo = time ? { time } : undefined;
+        const completedAt = timestampFromUnknown(time?.completed);
+        const isCompleted = typeof completedAt === "string";
+        const hasError = !!info?.error;
+
+        for (const rawPart of parts) {
+          const part = asRecord(rawPart);
+          if (!part) continue;
+          const partWithMessageID =
+            typeof part.messageID === "string" && part.messageID.length > 0
+              ? part
+              : parentMessageID
+                ? { ...part, messageID: parentMessageID }
+                : part;
+          if (
+            part.type === "subtask" ||
+            (part.type === "tool" && (part.tool === "delegate" || part.tool === "task"))
+          ) {
+            const fakeEvent = {
+              type: "message.part.updated",
+              properties: {
+                sessionID: currentSessionID,
+                info: eventInfo,
+                part: partWithMessageID,
+              },
+            };
+            if (applySubagentEvent(next, fakeEvent)) changed = true;
+
+            if (part.type === "subtask" && isAssistant && isCompleted) {
+              const childID = `subtask:${part.id}`;
+              const status = hasError ? "error" : "done";
+              if (markChildStatus(next, childID, status, completedAt)) changed = true;
+            }
+          }
+        }
+      }
+
+      if (!changed) return current;
+      persistStateSnapshot(statePath, textPath, next);
+      return next;
+    });
+    if (topLevelHydrationFailed || childHydrationFailed) return false;
+    return true;
+  } catch (err) {
+    debugLog({ kind: "hydration.error", sessionID: currentSessionID, error: String(err) });
+    return false;
+  }
+}
+
+async function safeReadAsync<Value>(read: () => Promise<Value>): Promise<Value | undefined> {
+  try {
+    return await read();
+  } catch {
+    return undefined;
+  }
+}
+
+function summarizeAssistantMessages(messages: unknown[]): {
+  completedAt?: string;
+  hasError: boolean;
+} {
+  let completedAt: string | undefined;
+  let hasError = false;
+  const assistantMessages = messages
+    .map((rawMessage) => asRecord(rawMessage))
+    .map((message) => asRecord(message?.info))
+    .filter(
+      (info): info is Record<string, unknown> => info?.role === "assistant",
+    )
+    .sort((left, right) => messageTimeMillis(left) - messageTimeMillis(right));
+
+  for (const info of assistantMessages) {
+    const time = asRecord(info.time);
+    const candidate = timestampFromUnknown(time?.completed);
+    if (info.error) {
+      hasError = true;
+    } else if (candidate) {
+      completedAt = candidate;
+      hasError = false;
+    }
+  }
+
+  return { completedAt, hasError };
+}
+
+function messageTimeMillis(info: Record<string, unknown> | undefined): number {
+  const time = asRecord(info?.time);
+  return (
+    timestampMillisFromUnknown(time?.completed) ??
+    timestampMillisFromUnknown(time?.updated) ??
+    timestampMillisFromUnknown(time?.created) ??
+    0
+  );
+}
+
+function sessionTimestamp(session: Record<string, unknown>, key: string): string | undefined {
+  const time = asRecord(session.time);
+  return timestampFromUnknown(time?.[key]);
+}
+
+function timestampFromUnknown(value: unknown): string | undefined {
+  const millis = timestampMillisFromUnknown(value);
+  return millis === undefined ? undefined : new Date(millis).toISOString();
+}
+
+function timestampMillisFromUnknown(value: unknown): number | undefined {
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? undefined : parsed;
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    const millis = value < 10_000_000_000 ? value * 1000 : value;
+    const parsed = new Date(millis);
+    return Number.isNaN(parsed.getTime()) ? undefined : millis;
+  }
+  return undefined;
+}
+
 const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const statePath = resolveStatePath();
   const textPath = resolveTextPath(statePath);
   const [state, setState] = createSignal<StatuslineState>(createEmptyState());
   const [nowMs, setNowMs] = createSignal(Date.now());
+  const [hydratedSessions, setHydratedSessions] = createSignal<Set<string>>(new Set());
+  const [hydratingSessions, setHydratingSessions] = createSignal<Set<string>>(new Set());
+  const [hydrateRetryTick, setHydrateRetryTick] = createSignal(0);
+
+  createEffect(() => {
+    hydrateRetryTick();
+    const route = api.route.current;
+    if (route.name === "session" && typeof route.params?.sessionID === "string") {
+      const sessionID = route.params.sessionID;
+      if (hydratedSessions().has(sessionID) || hydratingSessions().has(sessionID)) {
+        return;
+      }
+
+      setHydratingSessions((prev) => {
+        const next = new Set(prev);
+        next.add(sessionID);
+        return next;
+      });
+
+      void (async () => {
+        const hydrated = await hydratePreviousSubagents(
+          api,
+          sessionID,
+          statePath,
+          textPath,
+          setState,
+        );
+        setHydratingSessions((prev) => {
+          const next = new Set(prev);
+          next.delete(sessionID);
+          return next;
+        });
+        if (hydrated) {
+          setHydratedSessions((prev) => {
+            const next = new Set(prev);
+            next.add(sessionID);
+            return next;
+          });
+          return;
+        }
+        setTimeout(() => {
+          setHydrateRetryTick((value) => value + 1);
+        }, 1000);
+      })();
+    }
+  });
 
   const tick = setInterval(() => {
     setNowMs(Date.now());
@@ -701,6 +973,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
   const disposers = [
     api.event.on("session.created", applyEvent),
+    api.event.on("session.updated", applyEvent),
     api.event.on("session.idle", applyEvent),
     api.event.on("session.error", applyEvent),
     api.event.on("message.updated", applyEvent),
