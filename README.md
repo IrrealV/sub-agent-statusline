@@ -1,5 +1,89 @@
 # opencode-subagent-statusline
 
+OpenCode plugin para ver qué subagentes están corriendo, cuáles terminaron y cuánto contexto/tokens consumieron.
+
+Sirve en dos modos:
+
+- **TUI plugin**: muestra el panel `Subagents` dentro de la UI de OpenCode.
+- **Server/runtime plugin**: escribe `state.json` y `status.txt` para integrarlo como fallback/statusline externa.
+
+---
+
+## Probarlo desde este repo
+
+### Requisitos
+
+- Node.js moderno compatible con TypeScript ESM.
+- `pnpm`.
+- OpenCode instalado y funcionando.
+- Opcional: `sqlite3` si querés que el TUI intente rehidratar tokens de sesiones ya finalizadas desde la base local de OpenCode.
+
+### 1) Instalar dependencias
+
+```sh
+pnpm install
+```
+
+### 2) Compilar el plugin server/runtime
+
+```sh
+pnpm build
+```
+
+Esto genera `dist/index.js` y `dist/tui.js`.
+
+### 3) Activar el TUI plugin
+
+Editá `~/.config/opencode/tui.json` y agregá el plugin. Para probar rápido podés apuntar directo al source:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    "/home/joaquinvesapa/vesapa/sub-agent-statusline/src/tui.tsx"
+  ]
+}
+```
+
+Si preferís probar lo compilado:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    "/home/joaquinvesapa/vesapa/sub-agent-statusline/dist/tui.js"
+  ]
+}
+```
+
+> Este repo **no modifica tu `tui.json` automáticamente**. Lo editás vos, lo probás, y si no te gusta sacás esa línea. Es así de simple.
+
+### 4) Activar el plugin server/runtime opcional
+
+Si además querés que se escriban archivos para una statusline externa, agregá el runtime plugin en tu `opencode.json`:
+
+```json
+{
+  "plugin": [
+    "/home/joaquinvesapa/vesapa/sub-agent-statusline/dist/index.js"
+  ]
+}
+```
+
+### 5) Verificar que funciona
+
+Abrí OpenCode y dispará 2 o 3 subagentes/tareas en paralelo. Deberías ver:
+
+- En el sidebar: `Subagents` con `running`, `done` y `error`.
+- En la parte inferior/home: un resumen compacto.
+- Si activaste el runtime plugin: `state.json` y `status.txt` en el directorio runtime.
+
+Para limpiar la prueba, quitá la entrada del plugin en `tui.json`/`opencode.json` y reiniciá OpenCode.
+
+---
+
+## Qué hace
+
 TypeScript OpenCode plugin with **two surfaces**:
 
 1. **Server/runtime plugin** (`src/index.ts`) that persists `state.json` + `status.txt` (fallback/statusline integration).
@@ -47,7 +131,7 @@ Sidebar layout:
 
 - Title: `Subagents`
 - Aggregate: `● {running} running · ✓ {done} done · ✕ {error} error`
-- Per child: status icon + title + elapsed + context (`ctx ?`, `ctx 12.4k`, `%`)
+- Per child: status icon + title + elapsed + context when available (tokens and/or `%`)
 
 Theme usage:
 
@@ -70,7 +154,7 @@ No manual `state.json` creation is required. The server plugin writes:
 Example rendered line:
 
 ```txt
-↳ 2 running · 1 done · 0 error · build-index 01:23 ctx 12.4k · reviewer 00:41 ctx ? · test-fixes 00:12 ctx 31.0%
+↳ 2 running · 1 done · 0 error · build-index 01:23 ctx 12.4k tok · reviewer 00:41 · test-fixes 00:12 ctx 31.0%
 ```
 
 Default path (per OpenCode process):
@@ -141,4 +225,4 @@ OpenCode payloads can vary by event and version. This plugin intentionally uses 
 - updates message-derived details only for known child sessions
 - unknown/missing fields are ignored instead of crashing
 
-If token/context fields are unavailable, the UI/text rendering shows `ctx ?`.
+If token/context fields are unavailable, the UI/text rendering omits context for that child.

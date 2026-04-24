@@ -228,27 +228,36 @@ export async function saveState(
 export function upsertRunningChild(
   state: StatuslineState,
   input: Pick<ChildSessionState, "id" | "title" | "parentID"> &
-    Partial<Pick<ChildSessionState, "messageID" | "source">>,
+    Partial<
+      Pick<
+        ChildSessionState,
+        "messageID" | "source" | "startedAt" | "updatedAt"
+      >
+    >,
 ): boolean {
   const now = new Date().toISOString();
+  const observedUpdatedAt = safeTimestamp(input.updatedAt, now);
+  const observedStartedAt = safeTimestamp(input.startedAt, observedUpdatedAt);
   const existing = state.children[input.id];
+  const shouldKeepCompletedTiming =
+    existing?.status === "done" || existing?.status === "error";
   const next: ChildSessionState = {
     id: input.id,
     title: input.title,
     parentID: input.parentID,
     messageID: input.messageID ?? existing?.messageID,
     source: input.source ?? existing?.source ?? "session",
-    status: "running",
-    color: statusColor("running"),
-    startedAt: existing?.startedAt ?? now,
-    updatedAt: now,
-    endedAt: undefined,
+    status: shouldKeepCompletedTiming ? existing.status : "running",
+    color: statusColor(shouldKeepCompletedTiming ? existing.status : "running"),
+    startedAt: existing?.startedAt ?? observedStartedAt,
+    updatedAt: observedUpdatedAt,
+    endedAt: shouldKeepCompletedTiming ? existing.endedAt : undefined,
     elapsedMs: existing?.elapsedMs,
     tokens: existing?.tokens,
   };
 
   state.children[input.id] = next;
-  state.updatedAt = now;
+  state.updatedAt = observedUpdatedAt;
   return true;
 }
 
@@ -256,6 +265,7 @@ export function markChildStatus(
   state: StatuslineState,
   childID: string,
   status: Exclude<ChildStatus, "running">,
+  endedAt?: string,
 ): boolean {
   const existing = state.children[childID];
   if (!existing) {
@@ -263,14 +273,19 @@ export function markChildStatus(
   }
 
   const now = new Date().toISOString();
-  state.children[childID] = {
+  const observedEndedAt = safeTimestamp(endedAt, now);
+  const nextChild: ChildSessionState = {
     ...existing,
     status,
     color: statusColor(status),
-    updatedAt: now,
-    endedAt: now,
+    updatedAt: observedEndedAt,
+    endedAt: observedEndedAt,
   };
-  state.updatedAt = now;
+  state.children[childID] = {
+    ...nextChild,
+    elapsedMs: resolveElapsedMs(nextChild, Date.now()),
+  };
+  state.updatedAt = observedEndedAt;
   return true;
 }
 
@@ -280,6 +295,7 @@ export function upsertChildDetails(
   input: {
     title?: string;
     tokens?: ChildTokenState;
+    updatedAt?: string;
   },
 ): boolean {
   const existing = state.children[childID];
@@ -299,13 +315,14 @@ export function upsertChildDetails(
   if (!detailsChanged && !shouldTouch) return false;
 
   const now = new Date().toISOString();
+  const observedUpdatedAt = safeTimestamp(input.updatedAt, now);
   state.children[childID] = {
     ...existing,
     title: nextTitle,
     tokens: mergedTokens,
-    updatedAt: now,
+    updatedAt: observedUpdatedAt,
   };
-  state.updatedAt = now;
+  state.updatedAt = observedUpdatedAt;
   return true;
 }
 

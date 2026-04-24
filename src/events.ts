@@ -33,10 +33,13 @@ type SubtaskChild = {
   title: string;
   parentID: string;
   messageID: string;
+  startedAt?: string;
+  updatedAt?: string;
 };
 
 type ToolChild = SubtaskChild & {
   status: "running" | "done" | "error";
+  endedAt?: string;
 };
 
 export function asString(value: unknown): string | undefined {
@@ -47,6 +50,8 @@ export function extractCreatedChild(event: EventLike): {
   id: string;
   title: string;
   parentID: string;
+  startedAt?: string;
+  updatedAt?: string;
 } | null {
   const info = event.properties?.info;
   const parentID = asString(info?.parentID);
@@ -56,24 +61,75 @@ export function extractCreatedChild(event: EventLike): {
   if (!id) return null;
 
   const title = asString(info?.title) ?? "subagent";
-  return { id, title, parentID };
+  const startedAt = extractEventTimestamp(event, [
+    "started",
+    "start",
+    "created",
+    "updated",
+  ]);
+  const updatedAt =
+    extractEventTimestamp(event, ["updated", "created", "started", "start"]) ??
+    startedAt;
+  return { id, title, parentID, startedAt, updatedAt };
 }
 
 export function extractSessionID(event: EventLike): string | undefined {
   return (
-    asString(event.properties?.info?.id) ??
-    asString(event.properties?.id) ??
     asString(event.properties?.sessionID) ??
     asString(event.properties?.sessionId) ??
     asString(event.properties?.info?.sessionID) ??
     asString(event.properties?.info?.sessionId) ??
     asString(event.sessionID) ??
-    asString(event.sessionId)
+    asString(event.sessionId) ??
+    asString(event.properties?.info?.id) ??
+    asString(event.properties?.id)
   );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object";
+}
+
+function toIsoTimestamp(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    if (value.trim().length === 0) return undefined;
+    const parsed = Date.parse(value);
+    if (Number.isNaN(parsed)) return undefined;
+    return new Date(parsed).toISOString();
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value <= 0) return undefined;
+    const millis = value < 10_000_000_000 ? value * 1000 : value;
+    const parsed = new Date(millis);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
+  }
+
+  return undefined;
+}
+
+function extractEventTimestamp(event: EventLike, keys: string[]): string | undefined {
+  const part = isRecord(event.properties?.part) ? event.properties?.part : undefined;
+  const state = isRecord(part?.state) ? part?.state : undefined;
+  const sources = [
+    isRecord(event.properties?.info?.time) ? event.properties?.info?.time : undefined,
+    isRecord(part?.time) ? part?.time : undefined,
+    isRecord(part?.timestamps) ? part?.timestamps : undefined,
+    isRecord(state?.time) ? state?.time : undefined,
+    isRecord(state?.timestamps) ? state?.timestamps : undefined,
+    state,
+    part,
+  ];
+
+  for (const source of sources) {
+    if (!source) continue;
+    for (const key of keys) {
+      const candidate = toIsoTimestamp(source[key]);
+      if (candidate) return candidate;
+    }
+  }
+
+  return undefined;
 }
 
 function extractSubtaskChild(event: EventLike): SubtaskChild | null {
@@ -89,12 +145,23 @@ function extractSubtaskChild(event: EventLike): SubtaskChild | null {
   const command = asString(part.command);
   const agent = asString(part.agent);
   const title = description || command || agent || "subtask";
+  const startedAt = extractEventTimestamp(event, [
+    "started",
+    "start",
+    "created",
+    "updated",
+  ]);
+  const updatedAt =
+    extractEventTimestamp(event, ["updated", "created", "started", "start"]) ??
+    startedAt;
 
   return {
     id: `subtask:${partID}`,
     title,
     parentID,
     messageID,
+    startedAt,
+    updatedAt,
   };
 }
 
@@ -123,6 +190,19 @@ function extractToolChild(event: EventLike): ToolChild | null {
   const description = asString(input.description);
   const subagentType = asString(input.subagent_type);
   const title = asString(state.title) || description || subagentType || tool;
+  const startedAt = extractEventTimestamp(event, [
+    "started",
+    "start",
+    "created",
+    "updated",
+  ]);
+  const updatedAt =
+    extractEventTimestamp(event, ["updated", "completed", "created", "started", "start"]) ??
+    startedAt;
+  const endedAt =
+    status === "done" || status === "error"
+      ? extractEventTimestamp(event, ["completed", "ended", "updated"])
+      : undefined;
 
   return {
     id: `tool:${partID}`,
@@ -130,6 +210,9 @@ function extractToolChild(event: EventLike): ToolChild | null {
     parentID,
     messageID,
     status,
+    startedAt,
+    updatedAt,
+    endedAt,
   };
 }
 
@@ -150,6 +233,30 @@ function extractCompletedAssistantMessage(event: EventLike): {
   return { sessionID, messageID };
 }
 
+function extractDetailTargetIDs(event: EventLike): string[] {
+  const ids = new Set<string>();
+  const part = event.properties?.part;
+
+  if (isRecord(part)) {
+    const partID = asString(part.id);
+    if (part.type === "subtask" && partID) {
+      ids.add(`subtask:${partID}`);
+    }
+
+    if (part.type === "tool") {
+      const tool = asString(part.tool);
+      if ((tool === "delegate" || tool === "task") && partID) {
+        ids.add(`tool:${partID}`);
+      }
+    }
+  }
+
+  const sessionID = extractSessionID(event);
+  if (sessionID) ids.add(sessionID);
+
+  return [...ids];
+}
+
 function normalizePercent(value: number): number {
   if (value > 0 && value <= 1) {
     return value * 100;
@@ -160,11 +267,21 @@ function normalizePercent(value: number): number {
 export function extractChildDetails(event: EventLike): {
   title?: string;
   tokens?: ChildTokenState;
+  updatedAt?: string;
 } {
   const details: {
     title?: string;
     tokens?: ChildTokenState;
+    updatedAt?: string;
   } = {};
+
+  details.updatedAt = extractEventTimestamp(event, [
+    "updated",
+    "completed",
+    "created",
+    "started",
+    "start",
+  ]);
 
   const titleCandidates = [
     event.properties?.info?.title,
@@ -217,6 +334,8 @@ export function extractChildDetails(event: EventLike): {
           tokenHints.output = asNumber;
         } else if (key.includes("total") && key.includes("token")) {
           tokenHints.total = asNumber;
+        } else if (key === "tokens" || key === "token") {
+          tokenHints.total = asNumber;
         }
       }
 
@@ -248,41 +367,68 @@ export function applySubagentEvent(state: StatuslineState, event: unknown): bool
   if (type === "session.created") {
     const child = extractCreatedChild(e);
     if (child) {
-      return upsertRunningChild(state, child);
+      const details = extractChildDetails(e);
+      let changed = upsertRunningChild(state, child);
+      changed = upsertChildDetails(state, child.id, details) || changed;
+      return changed;
     }
     return false;
   }
 
   if (type === "session.idle") {
     const childID = extractSessionID(e);
-    return childID ? markChildStatus(state, childID, "done") : false;
+    if (!childID) return false;
+    const endedAt = extractEventTimestamp(e, ["completed", "ended", "updated"]);
+    const details = extractChildDetails(e);
+    let changed = markChildStatus(state, childID, "done", endedAt);
+    changed = upsertChildDetails(state, childID, details) || changed;
+    return changed;
   }
 
   if (type === "session.error") {
     const childID = extractSessionID(e);
-    return childID ? markChildStatus(state, childID, "error") : false;
+    if (!childID) return false;
+    const endedAt = extractEventTimestamp(e, ["completed", "ended", "updated"]);
+    const details = extractChildDetails(e);
+    let changed = markChildStatus(state, childID, "error", endedAt);
+    changed = upsertChildDetails(state, childID, details) || changed;
+    return changed;
   }
+
+  let changed = false;
 
   if (type === "message.part.updated") {
     const subtask = extractSubtaskChild(e);
     if (subtask) {
-      return upsertRunningChild(state, { ...subtask, source: "subtask" });
+      changed =
+        upsertRunningChild(state, {
+          ...subtask,
+          source: "subtask",
+          startedAt: subtask.startedAt,
+          updatedAt: subtask.updatedAt,
+        }) || changed;
     }
 
     const tool = extractToolChild(e);
     if (tool) {
-      const changed = upsertRunningChild(state, { ...tool, source: "tool" });
+      const childChanged = upsertRunningChild(state, {
+        ...tool,
+        source: "tool",
+        startedAt: tool.startedAt,
+        updatedAt: tool.updatedAt,
+      });
+      changed = childChanged || changed;
       if (tool.status === "done" || tool.status === "error") {
-        return markChildStatus(state, tool.id, tool.status) || changed;
+        changed =
+          markChildStatus(state, tool.id, tool.status, tool.endedAt ?? tool.updatedAt) ||
+          changed;
       }
-      return changed;
     }
   }
 
   if (type === "message.updated") {
     const completed = extractCompletedAssistantMessage(e);
     if (completed) {
-      let changed = false;
       for (const child of Object.values(state.children)) {
         if (
           child.source === "subtask" &&
@@ -293,17 +439,17 @@ export function applySubagentEvent(state: StatuslineState, event: unknown): bool
           changed = markChildStatus(state, child.id, "done") || changed;
         }
       }
-      if (changed) return true;
     }
   }
 
   if (type === "message.updated" || type === "message.part.updated") {
-    const childID = extractSessionID(e);
-    if (childID && state.children[childID]) {
-      const details = extractChildDetails(e);
-      return upsertChildDetails(state, childID, details);
+    const details = extractChildDetails(e);
+    for (const childID of extractDetailTargetIDs(e)) {
+      if (state.children[childID]) {
+        changed = upsertChildDetails(state, childID, details) || changed;
+      }
     }
   }
 
-  return false;
+  return changed;
 }

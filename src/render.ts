@@ -33,32 +33,102 @@ export function formatDuration(elapsedMs: number | undefined): string {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
-function compactNumber(value: number): string {
-  if (value >= 1000) {
-    return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)}k`;
-  }
-  return String(Math.round(value));
+function formatNumber(value: number): string {
+  return Math.max(0, Math.round(value)).toLocaleString("en-US");
 }
 
-export function formatContext(child: ChildSessionState): string {
-  const percent = child.tokens?.contextPercent;
-  if (typeof percent === "number" && Number.isFinite(percent)) {
-    return `ctx ${percent.toFixed(1)}%`;
-  }
-
+function resolveTokenTotal(child: ChildSessionState): number | undefined {
   const total = child.tokens?.total;
   if (typeof total === "number" && Number.isFinite(total)) {
-    return `ctx ${compactNumber(total)}`;
+    return total;
   }
 
   const inTokens = child.tokens?.input;
   const outTokens = child.tokens?.output;
   if (typeof inTokens === "number" || typeof outTokens === "number") {
-    const computedTotal = (inTokens ?? 0) + (outTokens ?? 0);
-    return `ctx ${compactNumber(computedTotal)}`;
+    return (inTokens ?? 0) + (outTokens ?? 0);
   }
 
-  return "ctx ?";
+  return undefined;
+}
+
+function formatPercentUsed(percent: number): string {
+  const rounded = Math.round(percent * 10) / 10;
+  if (Math.abs(rounded - Math.round(rounded)) < 0.05) {
+    return `${Math.round(rounded)}% used`;
+  }
+  return `${rounded.toFixed(1)}% used`;
+}
+
+function formatTokenCount(total: number): string {
+  const label = total === 1 ? "token" : "tokens";
+  return `${formatNumber(total)} ${label}`;
+}
+
+function formatCompactTokenCount(total: number): string {
+  const value = Math.max(0, total);
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(1)}M tok`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(1)}k tok`;
+  }
+  return `${Math.round(value)} tok`;
+}
+
+function formatCompactPercentUsed(percent: number): string {
+  const rounded = Math.round(percent);
+  return `${Math.max(0, rounded)}%`;
+}
+
+export function formatContextDetails(child: ChildSessionState): string | undefined {
+  const total = resolveTokenTotal(child);
+  const percent = child.tokens?.contextPercent;
+
+  const hasPercent = typeof percent === "number" && Number.isFinite(percent);
+  const hasTotal = typeof total === "number" && Number.isFinite(total);
+
+  if (hasTotal && hasPercent) {
+    return `${formatTokenCount(total)} · ${formatPercentUsed(percent)}`;
+  }
+
+  if (hasTotal) {
+    return formatTokenCount(total);
+  }
+
+  if (hasPercent) {
+    return formatPercentUsed(percent);
+  }
+
+  return undefined;
+}
+
+export function formatContext(child: ChildSessionState): string {
+  const details = formatContextDetails(child);
+  if (!details) return "";
+  return `ctx ${details}`;
+}
+
+export function formatContextCompact(child: ChildSessionState): string {
+  const total = resolveTokenTotal(child);
+  const percent = child.tokens?.contextPercent;
+
+  const hasPercent = typeof percent === "number" && Number.isFinite(percent);
+  const hasTotal = typeof total === "number" && Number.isFinite(total);
+
+  if (hasTotal && hasPercent) {
+    return `${formatCompactTokenCount(total)} ${formatCompactPercentUsed(percent)}`;
+  }
+
+  if (hasTotal) {
+    return formatCompactTokenCount(total);
+  }
+
+  if (hasPercent) {
+    return formatCompactPercentUsed(percent);
+  }
+
+  return "";
 }
 
 function childColor(child: ChildSessionState): string {
@@ -80,7 +150,17 @@ export function byPriority(a: ChildSessionState, b: ChildSessionState): number {
 }
 
 export function renderStatusLine(state: StatuslineState): string {
-  const children = Object.values(state.children).sort(byPriority);
+  const allChildren = Object.values(state.children);
+  const hasMatchingSubtask = (child: ChildSessionState): boolean =>
+    child.source === "tool" &&
+    allChildren.some(
+      (candidate) =>
+        candidate.source === "subtask" &&
+        candidate.parentID === child.parentID &&
+        candidate.messageID === child.messageID,
+    );
+
+  const children = allChildren.filter((child) => !hasMatchingSubtask(child)).sort(byPriority);
   const running = children.filter((c) => c.status === "running").length;
   const done = children.filter((c) => c.status === "done").length;
   const error = children.filter((c) => c.status === "error").length;
@@ -91,7 +171,10 @@ export function renderStatusLine(state: StatuslineState): string {
 
   const details = children
     .map((child) => {
-      const label = `${child.title} ${formatDuration(child.elapsedMs)} ${formatContext(child)}`;
+      const context = formatContext(child);
+      const label = [child.title, formatDuration(child.elapsedMs), context]
+        .filter((part) => part.length > 0)
+        .join(" ");
       return paint(label, childColor(child), colorOn);
     })
     .join(paint(" · ", ansi.gray, colorOn));
