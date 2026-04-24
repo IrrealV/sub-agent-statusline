@@ -33,6 +33,9 @@ const MIN_ROW_WIDTH = 24;
 const MIN_LABEL_WIDTH = 8;
 const DONE_TOKEN_REHYDRATE_THROTTLE_MS = 2000;
 const DONE_TOKEN_REHYDRATE_MAX_ATTEMPTS = 15;
+const HYDRATE_RETRY_BASE_DELAY_MS = 1000;
+const HYDRATE_RETRY_MAX_DELAY_MS = 30_000;
+const HYDRATE_RETRY_MAX_ATTEMPTS = 6;
 const CLOCK_ICON = "";
 const TOKEN_ICON = "";
 
@@ -673,6 +676,7 @@ async function hydratePreviousSubagents(
     const directory = api.state.path.directory;
     const sessionClient = api.client.session;
     let topLevelHydrationFailed = false;
+    let statusHydrationFailed = false;
 
     const [childrenResp, messagesResp, statusResp] = await Promise.all([
       (async () => {
@@ -695,7 +699,10 @@ async function hydratePreviousSubagents(
         const response = await safeReadAsync(() =>
           sessionClient?.status?.({ directory }) ?? Promise.resolve({ data: {} }),
         );
-        if (!response) topLevelHydrationFailed = true;
+        if (!response) {
+          topLevelHydrationFailed = true;
+          statusHydrationFailed = true;
+        }
         return response;
       })(),
     ]);
@@ -709,30 +716,33 @@ async function hydratePreviousSubagents(
         const session = asRecord(child);
         const childID = typeof session?.id === "string" ? session.id : undefined;
         if (!childID) {
-          return { childID: undefined, completedAt: undefined, hasError: false };
+          return {
+            childID: undefined,
+            completedAt: undefined,
+            evidenceAt: undefined,
+            hasError: false,
+            fetchFailed: false,
+          };
         }
         const childMessagesResp = await safeReadAsync(() =>
           sessionClient?.messages?.({ sessionID: childID, directory }) ??
             Promise.resolve({ data: [] }),
         );
+        let fetchFailed = false;
         if (!childMessagesResp) {
           childHydrationFailed = true;
+          fetchFailed = true;
         }
         const childMessages = Array.isArray(childMessagesResp?.data)
           ? childMessagesResp.data
           : [];
-        return { childID, ...summarizeAssistantMessages(childMessages) };
+        return { childID, ...summarizeAssistantMessages(childMessages), fetchFailed };
       }),
     );
-    const childErrors = new Set(
+    const childMessageSummaryByID = new Map(
       childMessageResults
-        .filter((result) => result.childID && result.hasError)
-        .map((result) => result.childID as string),
-    );
-    const childCompletedAt = new Map(
-      childMessageResults
-        .filter((result) => result.childID && result.completedAt)
-        .map((result) => [result.childID as string, result.completedAt as string]),
+        .filter((result) => result.childID)
+        .map((result) => [result.childID as string, result]),
     );
 
     setState((current) => {
@@ -752,11 +762,26 @@ async function hydratePreviousSubagents(
         if (applySubagentEvent(next, fakeEvent)) changed = true;
 
         const status = asRecord(allStatuses[session.id]);
-        const isBusy = status?.type === "busy";
-        const endedAt = childCompletedAt.get(session.id) ?? sessionTimestamp(session, "updated");
-        if (!isBusy && endedAt) {
-          const childStatus = childErrors.has(session.id) ? "error" : "done";
-          if (markChildStatus(next, session.id, childStatus, endedAt)) changed = true;
+        const sessionStatus = deriveSessionChildStatus(status);
+        const childSummary = childMessageSummaryByID.get(session.id);
+        const explicitCompletionEvidence =
+          !!childSummary &&
+          !childSummary.fetchFailed &&
+          (typeof childSummary.completedAt === "string" || childSummary.hasError);
+        const fallbackEndedAt = childSummary?.completedAt ?? childSummary?.evidenceAt;
+        const statusEndedAt =
+          fallbackEndedAt ??
+          sessionTimestamp(session, "completed") ??
+          sessionTimestamp(session, "updated");
+
+        if (sessionStatus === "done" || sessionStatus === "error") {
+          if (markChildStatus(next, session.id, sessionStatus, statusEndedAt)) changed = true;
+          continue;
+        }
+
+        if (!sessionStatus && !statusHydrationFailed && explicitCompletionEvidence) {
+          const childStatus = childSummary?.hasError ? "error" : "done";
+          if (markChildStatus(next, session.id, childStatus, fallbackEndedAt)) changed = true;
         }
       }
 
@@ -824,11 +849,57 @@ async function safeReadAsync<Value>(read: () => Promise<Value>): Promise<Value |
   }
 }
 
+function normalizedSessionStatusValue(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function deriveSessionChildStatus(
+  status: Record<string, unknown> | undefined,
+): ChildSessionState["status"] | undefined {
+  if (!status) return undefined;
+
+  if (status.error) return "error";
+
+  const values = [
+    normalizedSessionStatusValue(status.type),
+    normalizedSessionStatusValue(status.status),
+    normalizedSessionStatusValue(status.state),
+    normalizedSessionStatusValue(status.phase),
+    normalizedSessionStatusValue(status.result),
+  ].filter((value): value is string => Boolean(value));
+
+  if (status.busy === true || status.running === true) {
+    values.push("busy");
+  }
+
+  if (
+    values.some((value) =>
+      ["error", "failed", "failure", "cancelled", "canceled", "aborted"].includes(value),
+    )
+  ) {
+    return "error";
+  }
+
+  if (values.some((value) => ["busy", "running", "pending", "queued", "in_progress"].includes(value))) {
+    return "running";
+  }
+
+  if (values.some((value) => ["done", "completed", "complete", "success", "succeeded", "idle"].includes(value))) {
+    return "done";
+  }
+
+  return undefined;
+}
+
 function summarizeAssistantMessages(messages: unknown[]): {
   completedAt?: string;
+  evidenceAt?: string;
   hasError: boolean;
 } {
   let completedAt: string | undefined;
+  let evidenceAt: string | undefined;
   let hasError = false;
   const assistantMessages = messages
     .map((rawMessage) => asRecord(rawMessage))
@@ -841,15 +912,21 @@ function summarizeAssistantMessages(messages: unknown[]): {
   for (const info of assistantMessages) {
     const time = asRecord(info.time);
     const candidate = timestampFromUnknown(time?.completed);
+    const errorAt =
+      timestampFromUnknown(time?.updated) ??
+      timestampFromUnknown(time?.completed) ??
+      timestampFromUnknown(time?.created);
     if (info.error) {
       hasError = true;
+      evidenceAt = errorAt ?? evidenceAt;
     } else if (candidate) {
       completedAt = candidate;
+      evidenceAt = candidate;
       hasError = false;
     }
   }
 
-  return { completedAt, hasError };
+  return { completedAt, evidenceAt, hasError };
 }
 
 function messageTimeMillis(info: Record<string, unknown> | undefined): number {
@@ -892,49 +969,147 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const [nowMs, setNowMs] = createSignal(Date.now());
   const [hydratedSessions, setHydratedSessions] = createSignal<Set<string>>(new Set());
   const [hydratingSessions, setHydratingSessions] = createSignal<Set<string>>(new Set());
+  const [hydrateRetryPendingSessions, setHydrateRetryPendingSessions] = createSignal<Set<string>>(new Set());
+  const [hydrateRetryAttempts, setHydrateRetryAttempts] = createSignal<Map<string, number>>(new Map());
   const [hydrateRetryTick, setHydrateRetryTick] = createSignal(0);
+  const hydrateRetryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  let disposed = false;
+  let previousRouteSessionID: string | undefined;
+
+  const clearHydrateRetryTimeout = (sessionID: string): void => {
+    const timeout = hydrateRetryTimeouts.get(sessionID);
+    if (timeout) {
+      clearTimeout(timeout);
+      hydrateRetryTimeouts.delete(sessionID);
+    }
+  };
+
+  const resetHydrateRetry = (sessionID: string | undefined): void => {
+    if (!sessionID) return;
+    clearHydrateRetryTimeout(sessionID);
+    setHydrateRetryPendingSessions((prev) => {
+      if (!prev.has(sessionID)) return prev;
+      const next = new Set(prev);
+      next.delete(sessionID);
+      return next;
+    });
+    setHydrateRetryAttempts((prev) => {
+      if (!prev.has(sessionID)) return prev;
+      const next = new Map(prev);
+      next.delete(sessionID);
+      return next;
+    });
+  };
 
   createEffect(() => {
     hydrateRetryTick();
     const route = api.route.current;
-    if (route.name === "session" && typeof route.params?.sessionID === "string") {
-      const sessionID = route.params.sessionID;
-      if (hydratedSessions().has(sessionID) || hydratingSessions().has(sessionID)) {
-        return;
-      }
+    const routeSessionID =
+      route.name === "session" && typeof route.params?.sessionID === "string"
+        ? route.params.sessionID
+        : undefined;
 
-      setHydratingSessions((prev) => {
-        const next = new Set(prev);
-        next.add(sessionID);
-        return next;
-      });
+    if (previousRouteSessionID && previousRouteSessionID !== routeSessionID) {
+      resetHydrateRetry(previousRouteSessionID);
+    }
+    previousRouteSessionID = routeSessionID;
 
-      void (async () => {
-        const hydrated = await hydratePreviousSubagents(
-          api,
-          sessionID,
-          statePath,
-          textPath,
-          setState,
-        );
+    if (!routeSessionID) return;
+
+    const sessionID = routeSessionID;
+    const currentAttempts = hydrateRetryAttempts().get(sessionID) ?? 0;
+    if (
+      currentAttempts >= HYDRATE_RETRY_MAX_ATTEMPTS ||
+      hydratedSessions().has(sessionID) ||
+      hydratingSessions().has(sessionID) ||
+      hydrateRetryPendingSessions().has(sessionID)
+    ) {
+      return;
+    }
+
+    setHydratingSessions((prev) => {
+      const next = new Set(prev);
+      next.add(sessionID);
+      return next;
+    });
+
+    void (async () => {
+      const finishHydrating = (): void => {
         setHydratingSessions((prev) => {
           const next = new Set(prev);
           next.delete(sessionID);
           return next;
         });
-        if (hydrated) {
-          setHydratedSessions((prev) => {
-            const next = new Set(prev);
-            next.add(sessionID);
-            return next;
-          });
-          return;
-        }
-        setTimeout(() => {
-          setHydrateRetryTick((value) => value + 1);
-        }, 1000);
-      })();
-    }
+      };
+
+      const hydrated = await hydratePreviousSubagents(
+        api,
+        sessionID,
+        statePath,
+        textPath,
+        setState,
+      );
+      if (disposed) {
+        clearHydrateRetryTimeout(sessionID);
+        finishHydrating();
+        return;
+      }
+      if (hydrated) {
+        resetHydrateRetry(sessionID);
+        setHydratedSessions((prev) => {
+          const next = new Set(prev);
+          next.add(sessionID);
+          return next;
+        });
+        finishHydrating();
+        return;
+      }
+
+      const attempts = hydrateRetryAttempts().get(sessionID) ?? 0;
+      if (attempts >= HYDRATE_RETRY_MAX_ATTEMPTS) {
+        setHydrateRetryPendingSessions((prev) => {
+          if (!prev.has(sessionID)) return prev;
+          const next = new Set(prev);
+          next.delete(sessionID);
+          return next;
+        });
+        clearHydrateRetryTimeout(sessionID);
+        finishHydrating();
+        return;
+      }
+
+      const delayMs = Math.min(
+        HYDRATE_RETRY_MAX_DELAY_MS,
+        HYDRATE_RETRY_BASE_DELAY_MS * 2 ** attempts,
+      );
+
+      setHydrateRetryAttempts((prev) => {
+        const next = new Map(prev);
+        next.set(sessionID, attempts + 1);
+        return next;
+      });
+
+      setHydrateRetryPendingSessions((prev) => {
+        const next = new Set(prev);
+        next.add(sessionID);
+        return next;
+      });
+      finishHydrating();
+
+      clearHydrateRetryTimeout(sessionID);
+      const timeout = setTimeout(() => {
+        hydrateRetryTimeouts.delete(sessionID);
+        setHydrateRetryPendingSessions((prev) => {
+          if (!prev.has(sessionID)) return prev;
+          const next = new Set(prev);
+          next.delete(sessionID);
+          return next;
+        });
+        if (disposed) return;
+        setHydrateRetryTick((value) => value + 1);
+      }, delayMs);
+      hydrateRetryTimeouts.set(sessionID, timeout);
+    })();
   });
 
   const tick = setInterval(() => {
@@ -981,7 +1156,12 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   ];
 
   api.lifecycle.onDispose(() => {
+    disposed = true;
     clearInterval(tick);
+    for (const timeout of hydrateRetryTimeouts.values()) {
+      clearTimeout(timeout);
+    }
+    hydrateRetryTimeouts.clear();
     for (const dispose of disposers) {
       dispose();
     }
