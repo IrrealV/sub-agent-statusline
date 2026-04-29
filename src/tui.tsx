@@ -29,15 +29,14 @@ import type { Accessor } from "solid-js";
 import { applySubagentEvent, extractChildDetails } from "./events.js";
 import {
   byPriority,
-  collapseSubagentWorkItems,
   formatDuration,
-  isVisibleWorkItem,
   renderStatusLine,
   visibleSubagentWorkItems,
 } from "./render.js";
 import {
   createEmptyState,
   markChildStatus,
+  refreshDerivedFields,
   resolveStatePath,
   resolveTextPath,
   saveState,
@@ -60,12 +59,13 @@ const CLOCK_ICON = "";
 const TOKEN_ICON = "";
 const SUBAGENTS_EXPANDED_KV_KEY = "subagents.sidebar.expanded";
 const SUBAGENTS_SECTION_ENABLED_KV_KEY = "subagents.sidebar.enabled";
-const SUBAGENTS_VISIBLE_ROWS = 5;
-const SUBAGENTS_ROW_HEIGHT = 3;
+const SUBAGENTS_MAX_VISIBLE_ROWS = 5;
+const SUBAGENTS_RUNNING_ROW_HEIGHT = 3;
+const SUBAGENTS_TERMINAL_ROW_HEIGHT = 2;
 const SUBAGENTS_ROW_GAP = 0;
 const SUBAGENTS_MAX_LIST_HEIGHT =
-  SUBAGENTS_VISIBLE_ROWS * SUBAGENTS_ROW_HEIGHT +
-  (SUBAGENTS_VISIBLE_ROWS - 1) * SUBAGENTS_ROW_GAP;
+  SUBAGENTS_MAX_VISIBLE_ROWS * SUBAGENTS_RUNNING_ROW_HEIGHT +
+  (SUBAGENTS_MAX_VISIBLE_ROWS - 1) * SUBAGENTS_ROW_GAP;
 const INACTIVE_SUBAGENT_OPACITY = 0.65;
 
 interface SidebarScrollRegistration {
@@ -139,6 +139,8 @@ function debugEvent(event: unknown): void {
 function cloneState(state: StatuslineState): StatuslineState {
   return {
     updatedAt: state.updatedAt,
+    totalExecuted: state.totalExecuted,
+    countedChildIDs: { ...state.countedChildIDs },
     children: Object.fromEntries(
       Object.entries(state.children).map(([id, child]) => [
         id,
@@ -431,6 +433,21 @@ function persistStateSnapshot(
   })();
 }
 
+function refreshLiveState(state: StatuslineState): boolean {
+  const beforeChildIDs = new Set(Object.keys(state.children));
+  refreshDerivedFields(state);
+
+  if (Object.keys(state.children).length !== beforeChildIDs.size) {
+    return true;
+  }
+
+  for (const childID of beforeChildIDs) {
+    if (!state.children[childID]) return true;
+  }
+
+  return false;
+}
+
 function elapsedMs(child: ChildSessionState, nowMs: number): number {
   if (child.status !== "running") {
     return child.elapsedMs ?? 0;
@@ -537,12 +554,6 @@ function navigateToSessionTarget(
   api.route.navigate("session", { sessionID: targetSessionID });
 }
 
-function collapseToolWrappers(
-  children: ChildSessionState[],
-): ChildSessionState[] {
-  return collapseSubagentWorkItems(children);
-}
-
 function toFinitePositiveInt(value: unknown): number | undefined {
   if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
   const rounded = Math.floor(value);
@@ -636,9 +647,9 @@ function resolveTokenTotal(child: ChildSessionState): number | undefined {
 
 function formatCompactTokenCount(total: number): string {
   const value = Math.max(0, total);
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M tok`;
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k tok`;
-  return `${Math.round(value)} tok`;
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M ctx`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k ctx`;
+  return `${Math.round(value)} ctx`;
 }
 
 function formatCompactPercent(percent: number): string {
@@ -745,6 +756,38 @@ function formatChildRowLine(input: {
   };
 }
 
+function formatTerminalChildRowLine(input: {
+  child: ChildSessionState;
+  nowMs: number;
+  sidebarWidth?: number;
+  reservedWidth?: number;
+}): {
+  label: string;
+  meta: string;
+} {
+  const elapsed = formatDuration(elapsedMs(input.child, input.nowMs));
+  const width = Math.max(MIN_ROW_WIDTH, rowWidthBudget(input.sidebarWidth));
+  const title = splitParentheticalTitle(childPrimaryText(input.child));
+  const parenthetical = childParenthetical(input.child);
+  const labelSource = parenthetical
+    ? `${title.label} ${parenthetical}`
+    : title.label;
+  const context = contextVariants(input.child).find((variant) => variant.length > 0);
+
+  return {
+    label: ellipsize(labelSource, Math.max(1, width - (input.reservedWidth ?? 0))),
+    meta: context
+      ? `${elapsed} ${context}`
+      : elapsed,
+  };
+}
+
+function subagentRowHeight(child: ChildSessionState): number {
+  return child.status === "running"
+    ? SUBAGENTS_RUNNING_ROW_HEIGHT
+    : SUBAGENTS_TERMINAL_ROW_HEIGHT;
+}
+
 function SidebarSubagents(props: {
   api: TuiPluginApi;
   sessionID: string;
@@ -756,23 +799,21 @@ function SidebarSubagents(props: {
   theme: TuiThemeCurrent;
 }) {
   const children = createMemo(() =>
-    collapseToolWrappers(
+    visibleSubagentWorkItems(
       Object.values(props.state().children).filter(
         (child) => child.parentID === props.sessionID,
       ),
-    )
-      .filter((child) => isVisibleWorkItem(child, props.nowMs()))
-      .sort(byPriority),
+      props.nowMs(),
+    ).sort(byPriority),
   );
 
   const otherChildren = createMemo(() =>
-    collapseToolWrappers(
+    visibleSubagentWorkItems(
       Object.values(props.state().children).filter(
         (child) => child.parentID !== props.sessionID,
       ),
-    )
-      .filter((child) => isVisibleWorkItem(child, props.nowMs()))
-      .sort(byPriority),
+      props.nowMs(),
+    ).sort(byPriority),
   );
 
   const counts = createMemo(() => {
@@ -784,6 +825,7 @@ function SidebarSubagents(props: {
     }
     return result;
   });
+  const totalExecuted = createMemo(() => props.state().totalExecuted ?? 0);
 
   const visibleChildren = createMemo(() => {
     const ownChildren = children();
@@ -816,6 +858,17 @@ function SidebarSubagents(props: {
       )
       .join("|"),
   );
+
+  const listHeight = createMemo(() => {
+    const contentHeight =
+      visibleChildren().reduce(
+        (height, child) => height + subagentRowHeight(child),
+        showingOtherSessions() ? 1 : 0,
+      ) +
+      Math.max(0, visibleChildren().length - 1) * SUBAGENTS_ROW_GAP;
+
+    return Math.max(1, Math.min(SUBAGENTS_MAX_LIST_HEIGHT, contentHeight));
+  });
 
   let scrollbox: ScrollBoxRenderable | undefined;
   let restoreScrollTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -882,7 +935,23 @@ function SidebarSubagents(props: {
         reservedWidth: markerWidth,
       });
     });
+    const terminalLine = createMemo(() => {
+      const currentChild = child();
+      if (!currentChild) return { label: "", meta: "00:00" };
+      return formatTerminalChildRowLine({
+        child: currentChild,
+        nowMs: props.nowMs(),
+        sidebarWidth: props.sidebarWidth?.(),
+        reservedWidth: markerWidth,
+      });
+    });
     const hasSecondaryLine = createMemo(() => Boolean(line().secondaryLine));
+    const rowHeight = createMemo(() => {
+      if (status() !== "running") return SUBAGENTS_TERMINAL_ROW_HEIGHT;
+      return hasSecondaryLine()
+        ? SUBAGENTS_RUNNING_ROW_HEIGHT
+        : SUBAGENTS_RUNNING_ROW_HEIGHT - 1;
+    });
     const activate = () =>
       navigateToSessionTarget(props.api, targetSessionID());
     const handleKeyDown = (event: { name: string }): void => {
@@ -896,11 +965,7 @@ function SidebarSubagents(props: {
     return (
       <box
         flexDirection="column"
-        height={
-          hasSecondaryLine()
-            ? SUBAGENTS_ROW_HEIGHT
-            : SUBAGENTS_ROW_HEIGHT - 1
-        }
+        height={rowHeight()}
         opacity={rowOpacity()}
         onMouseOver={clickable() ? () => setHovered(true) : undefined}
         onMouseOut={
@@ -916,42 +981,65 @@ function SidebarSubagents(props: {
         focusable={clickable()}
         focused={clickable() && focused()}
       >
-        <box flexDirection="row">
-          <text fg={statusColor(status(), props.theme)}>
-            {taskStatusMarker(status())}
-          </text>
-          <text
-            fg={muted() ? props.theme.textMuted : props.theme.text}
-          >{` ${line().labelLines[0] ?? ""}`}</text>
-        </box>
-        <Show when={line().secondaryLine}>
-          {(secondaryLine: Accessor<string>) => (
-            <text
-              fg={muted() ? props.theme.textMuted : props.theme.text}
-            >{`    ${secondaryLine()}`}</text>
-          )}
+        <Show
+          when={status() === "running"}
+          fallback={
+            <box flexDirection="column">
+              <box flexDirection="row">
+                <text fg={statusColor(status(), props.theme)}>
+                  {taskStatusMarker(status())}
+                </text>
+                <text
+                  fg={muted() ? props.theme.textMuted : props.theme.text}
+                >{` ${terminalLine().label}`}</text>
+              </box>
+              <text
+                fg={emphasized() ? props.theme.text : props.theme.textMuted}
+              >{`    ↳ ${CLOCK_ICON} ${terminalLine().meta}`}</text>
+            </box>
+          }
+        >
+          <box flexDirection="column">
+            <box flexDirection="row">
+              <text fg={statusColor(status(), props.theme)}>
+                {taskStatusMarker(status())}
+              </text>
+              <text
+                fg={muted() ? props.theme.textMuted : props.theme.text}
+              >{` ${line().labelLines[0] ?? ""}`}</text>
+            </box>
+            <Show when={line().secondaryLine}>
+              {(secondaryLine: Accessor<string>) => (
+                <text
+                  fg={muted() ? props.theme.textMuted : props.theme.text}
+                >{`    ${secondaryLine()}`}</text>
+              )}
+            </Show>
+            <box flexDirection="row" paddingLeft={4}>
+              <text
+                fg={emphasized() ? props.theme.text : props.theme.textMuted}
+              >{`↳ ${CLOCK_ICON} ${line().elapsed}`}</text>
+              <Show when={line().meta.length > 0}>
+                <text
+                  fg={emphasized() ? props.theme.text : props.theme.textMuted}
+                >{` ${TOKEN_ICON} ${line().meta}`}</text>
+              </Show>
+            </box>
+          </box>
         </Show>
-        <box flexDirection="row" paddingLeft={4}>
-          <text
-            fg={emphasized() ? props.theme.text : props.theme.textMuted}
-          >{`↳ ${CLOCK_ICON} ${line().elapsed}`}</text>
-          <Show when={line().meta.length > 0}>
-            <text
-              fg={emphasized() ? props.theme.text : props.theme.textMuted}
-            >{` ${TOKEN_ICON} ${line().meta}`}</text>
-          </Show>
-        </box>
       </box>
     );
   };
 
   const AggregateBar = () => (
     <box flexDirection="row" paddingRight={1}>
-      <text fg={props.theme.warning}>{`● ${counts().running} running`}</text>
+      <text fg={props.theme.warning}>{`● ${counts().running} run`}</text>
       <text fg={props.theme.textMuted}> · </text>
       <text fg={props.theme.success}>{`✓ ${counts().done} done`}</text>
       <text fg={props.theme.textMuted}> · </text>
-      <text fg={props.theme.error}>{`✕ ${counts().error} error`}</text>
+      <text fg={props.theme.error}>{`✕ ${counts().error} err`}</text>
+      <text fg={props.theme.textMuted}> · </text>
+      <text fg={props.theme.text}>{`Σ ${totalExecuted()}`}</text>
     </box>
   );
 
@@ -969,7 +1057,7 @@ function SidebarSubagents(props: {
           ref={(element) => {
             scrollbox = element;
           }}
-          height={SUBAGENTS_MAX_LIST_HEIGHT}
+          height={listHeight()}
           scrollY
           viewportCulling={false}
         >
@@ -1000,7 +1088,10 @@ function HomeBottomStatus(props: {
     }
     return result;
   });
-  const visible = createMemo(() => counts().running > 0 || counts().error > 0);
+  const totalExecuted = createMemo(() => props.state().totalExecuted ?? 0);
+  const visible = createMemo(
+    () => counts().running > 0 || counts().error > 0 || totalExecuted() > 0,
+  );
 
   return (
     <Show when={visible()}>
@@ -1011,6 +1102,8 @@ function HomeBottomStatus(props: {
           <text fg={props.theme.success}>{`✓ ${counts().done}`}</text>
           <text fg={props.theme.textMuted}> · </text>
           <text fg={props.theme.error}>{`✕ ${counts().error}`}</text>
+          <text fg={props.theme.textMuted}> · </text>
+          <text fg={props.theme.text}>{`Σ ${totalExecuted()}`}</text>
         </box>
       </box>
     </Show>
@@ -1212,7 +1305,8 @@ async function hydratePreviousSubagents(
         changed = true;
       }
 
-      if (!changed) return current;
+      const refreshed = refreshLiveState(next);
+      if (!changed && !refreshed) return current;
       persistStateSnapshot(statePath, textPath, next);
       return next;
     });
@@ -1577,7 +1671,9 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     setNowMs(Date.now());
     setState((current: StatuslineState) => {
       const next = cloneState(current);
-      if (!hydrateStateTokensFromTuiState(api, next)) return current;
+      const hydrated = hydrateStateTokensFromTuiState(api, next);
+      const refreshed = refreshLiveState(next);
+      if (!hydrated && !refreshed) return current;
       persistStateSnapshot(statePath, textPath, next);
       return next;
     });
@@ -1602,7 +1698,8 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
           })),
         });
       }
-      if (!changed && !hydrated) return current;
+      const refreshed = refreshLiveState(next);
+      if (!changed && !hydrated && !refreshed) return current;
       persistStateSnapshot(statePath, textPath, next);
       return next;
     });
