@@ -37,9 +37,11 @@ import {
   capCandidates,
   hasRecentMessageActivity,
   nextBackoffState,
+  resolvePersistedStaleSubtaskFromParentMessages,
   shouldApplyStaleRunningFallback,
   shouldSkipCandidateForBackoff,
   summarizeSessionMessages,
+  type PersistedStaleSubtaskCandidate,
   type RunningReconcileCacheEntry,
   type RunningReconcileEvidence,
 } from "./reconcile.js";
@@ -50,6 +52,7 @@ import {
   resolveStatePath,
   resolveTextPath,
   saveState,
+  upsertChildDetails,
   type ChildTokenState,
   type ChildSessionState,
   type StatuslineState,
@@ -119,7 +122,13 @@ interface RehydratedTokenCacheEntry {
 
 interface RunningReconcileCandidate {
   childID: string;
-  targetSessionID: string;
+  targetSessionID?: string;
+  parentID?: string;
+  messageID?: string;
+  source?: ChildSessionState["source"];
+  title?: string;
+  summary?: string;
+  agentName?: string;
   startedMs: number;
   updatedMs: number;
 }
@@ -1532,12 +1541,27 @@ function selectRunningReconcileCandidates(input: {
   for (const child of ordered) {
     if (seen.has(child.id)) continue;
     seen.add(child.id);
-    const targetSessionID = resolveReconcileTargetSessionID(input.state, child);
-    if (!targetSessionID) continue;
     const age = resolveRunningChildAgeMillis(child, input.nowMs);
+    const targetSessionID = resolveReconcileTargetSessionID(input.state, child);
+    const canProbePersistedSubtask =
+      child.source === "subtask" &&
+      !targetSessionID &&
+      typeof child.parentID === "string" &&
+      child.parentID.length > 0 &&
+      typeof child.messageID === "string" &&
+      child.messageID.length > 0 &&
+      (age.startedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS ||
+        age.updatedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS);
+    if (!targetSessionID && !canProbePersistedSubtask) continue;
     selected.push({
       childID: child.id,
       targetSessionID,
+      parentID: child.parentID,
+      messageID: child.messageID,
+      source: child.source,
+      title: child.title,
+      summary: child.summary,
+      agentName: child.agentName,
       startedMs: age.startedMs,
       updatedMs: age.updatedMs,
     });
@@ -1880,15 +1904,80 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       });
 
       const mutations: Array<{
+        childID: string;
         targetSessionID: string;
         status: "done" | "error";
         endedAt?: string;
+        reconcileWithoutTargetSessionID?: boolean;
       }> = [];
 
       for (const candidate of selected) {
-        const key = candidate.targetSessionID;
+        const key = candidate.targetSessionID ?? candidate.childID;
         const cache = runningReconcileBackoff.get(key);
         if (shouldSkipCandidateForBackoff(cache, nowMs)) continue;
+
+        if (!candidate.targetSessionID) {
+          const isPersistedSubtaskCandidate =
+            candidate.source === "subtask" &&
+            typeof candidate.parentID === "string" &&
+            candidate.parentID.length > 0 &&
+            typeof candidate.messageID === "string" &&
+            candidate.messageID.length > 0;
+          if (!isPersistedSubtaskCandidate) continue;
+
+          const parentMessagesResp = await safeReadAsync(() =>
+            api.client.session.messages({
+              sessionID: candidate.parentID as string,
+              directory,
+            }),
+          );
+          if (parentMessagesResp === undefined || !Array.isArray(parentMessagesResp?.data)) {
+            runningReconcileBackoff.set(
+              key,
+              nextBackoffState({
+                cache,
+                nowMs,
+                initialBackoffMs: RUNNING_RECONCILE_INITIAL_BACKOFF_MS,
+                maxBackoffMs: RUNNING_RECONCILE_MAX_BACKOFF_MS,
+              }),
+            );
+            continue;
+          }
+
+          const evidence = resolvePersistedStaleSubtaskFromParentMessages({
+            candidate: {
+              childID: candidate.childID,
+              parentID: candidate.parentID as string,
+              messageID: candidate.messageID as string,
+              title: candidate.title,
+              summary: candidate.summary,
+              agentName: candidate.agentName,
+            } satisfies PersistedStaleSubtaskCandidate,
+            messages: parentMessagesResp.data,
+          });
+          if (!evidence) {
+            runningReconcileBackoff.set(
+              key,
+              nextBackoffState({
+                cache,
+                nowMs,
+                initialBackoffMs: RUNNING_RECONCILE_INITIAL_BACKOFF_MS,
+                maxBackoffMs: RUNNING_RECONCILE_MAX_BACKOFF_MS,
+              }),
+            );
+            continue;
+          }
+
+          mutations.push({
+            childID: candidate.childID,
+            targetSessionID: evidence.targetSessionID ?? candidate.childID,
+            status: evidence.status,
+            endedAt: evidence.endedAt,
+            reconcileWithoutTargetSessionID: true,
+          });
+          runningReconcileBackoff.delete(key);
+          continue;
+        }
 
         const evidence = await probeRunningEvidence({
           api,
@@ -1900,6 +1989,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
         if (evidence.status === "done" || evidence.status === "error") {
           mutations.push({
+            childID: candidate.childID,
             targetSessionID: candidate.targetSessionID,
             status: evidence.status,
             endedAt: evidence.endedAt,
@@ -1925,6 +2015,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
 
         if (shouldApplyFallback) {
           mutations.push({
+            childID: candidate.childID,
             targetSessionID: candidate.targetSessionID,
             status: "done",
             endedAt: new Date(nowMs - candidate.updatedMs).toISOString(),
@@ -1952,10 +2043,19 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         let changed = false;
 
         for (const mutation of mutations) {
+          if (mutation.reconcileWithoutTargetSessionID && mutation.targetSessionID.startsWith("ses_")) {
+            changed =
+              upsertChildDetails(next, mutation.childID, {
+                targetSessionID: mutation.targetSessionID,
+                updatedAt: mutation.endedAt,
+              }) || changed;
+          }
           if (
             markChildStatus(
               next,
-              mutation.targetSessionID,
+              mutation.reconcileWithoutTargetSessionID
+                ? mutation.childID
+                : mutation.targetSessionID,
               mutation.status,
               mutation.endedAt,
             )
