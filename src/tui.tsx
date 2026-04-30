@@ -65,7 +65,7 @@ const DONE_TOKEN_REHYDRATE_MAX_ATTEMPTS = 15;
 const HYDRATE_RETRY_BASE_DELAY_MS = 1000;
 const HYDRATE_RETRY_MAX_DELAY_MS = 30_000;
 const HYDRATE_RETRY_MAX_ATTEMPTS = 6;
-const RUNNING_RECONCILE_INTERVAL_MS = 15_000;
+const RUNNING_RECONCILE_MAINTENANCE_INTERVAL_MS = 10 * 60_000;
 const RUNNING_RECONCILE_MAX_CANDIDATES = 8;
 const RUNNING_RECONCILE_INITIAL_BACKOFF_MS = 15_000;
 const RUNNING_RECONCILE_MAX_BACKOFF_MS = 5 * 60_000;
@@ -1670,6 +1670,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const hydrateRetryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
   const runningReconcileBackoff = new Map<string, RunningReconcileCacheEntry>();
   let reconcileInFlight = false;
+  let lastRunningReconcileAtMs = 0;
   let disposed = false;
   let previousRouteSessionID: string | undefined;
 
@@ -1840,8 +1841,16 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   });
 
   const tick = setInterval(() => {
+    const currentNowMs = Date.now();
+    const shouldRunReconcileMaintenance =
+      currentNowMs - lastRunningReconcileAtMs >=
+      RUNNING_RECONCILE_MAINTENANCE_INTERVAL_MS;
+    if (shouldRunReconcileMaintenance) {
+      void reconcileRunningChildren();
+    }
+
     snapshotSidebarScrollOffsets();
-    setNowMs(Date.now());
+    setNowMs(currentNowMs);
     setState((current: StatuslineState) => {
       const next = cloneState(current);
       const hydrated = hydrateStateTokensFromTuiState(api, next);
@@ -1855,6 +1864,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const reconcileRunningChildren = async (): Promise<void> => {
     if (reconcileInFlight || disposed) return;
     reconcileInFlight = true;
+    lastRunningReconcileAtMs = Date.now();
 
     try {
       const snapshot = cloneState(state());
@@ -1964,10 +1974,6 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     }
   };
 
-  const reconcileTimer = setInterval(() => {
-    void reconcileRunningChildren();
-  }, RUNNING_RECONCILE_INTERVAL_MS);
-
   const applyEvent = (event: unknown): void => {
     debugEvent(event);
     snapshotSidebarScrollOffsets();
@@ -2006,7 +2012,6 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   api.lifecycle.onDispose(() => {
     disposed = true;
     clearInterval(tick);
-    clearInterval(reconcileTimer);
     for (const timeout of hydrateRetryTimeouts.values()) {
       clearTimeout(timeout);
     }
