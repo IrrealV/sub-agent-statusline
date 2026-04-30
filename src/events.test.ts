@@ -248,4 +248,47 @@ describe("task tool to subtask mapping", () => {
       "2026-04-30T12:10:00.000Z",
     );
   });
+
+  it("maps assistant task-tool evidence to subtask created in parent user message", () => {
+    const state = createEmptyState();
+    upsertSubtask(state, {
+      partID: "prt_ddea56110001RtlmRJFV99PmiU",
+      parentID: "ses_2215a9f08ffewGBrk9aJ973lCD",
+      messageID: "msg_ddea560fd001mnSF0ssrplOLZq",
+      description: "Execute subtask",
+    });
+
+    applySubagentEvent(state, {
+      type: "message.part.updated",
+      properties: {
+        sessionID: "ses_2215a9f08ffewGBrk9aJ973lCD",
+        info: {
+          id: "msg_ddea5612d001eF07FXVVp66x4u",
+          parentID: "msg_ddea560fd001mnSF0ssrplOLZq",
+        },
+        part: {
+          type: "tool",
+          tool: "task",
+          id: "tool_ddea5612d001eF07FXVVp66x4u",
+          sessionID: "ses_2215a9f08ffewGBrk9aJ973lCD",
+          messageID: "msg_ddea5612d001eF07FXVVp66x4u",
+          state: {
+            status: "completed",
+            metadata: { sessionId: "ses_2215a9eceffelCOOb8v66cT2v0" },
+            time: { end: "2026-04-30T12:20:00.000Z" },
+          },
+        },
+      },
+    });
+
+    expect(state.children["subtask:prt_ddea56110001RtlmRJFV99PmiU"]?.status).toBe(
+      "done",
+    );
+    expect(
+      state.children["subtask:prt_ddea56110001RtlmRJFV99PmiU"]?.targetSessionID,
+    ).toBe("ses_2215a9eceffelCOOb8v66cT2v0");
+    expect(state.children["subtask:prt_ddea56110001RtlmRJFV99PmiU"]?.endedAt).toBe(
+      "2026-04-30T12:20:00.000Z",
+    );
+  });
 });
