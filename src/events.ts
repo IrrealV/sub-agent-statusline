@@ -47,6 +47,14 @@ type ToolChild = SubtaskChild & {
   endedAt?: string;
 };
 
+export type TaskToolStatus = "running" | "done" | "error";
+
+export type TaskToolEvidence = {
+  status: TaskToolStatus;
+  targetSessionID?: string;
+  endedAt?: string;
+};
+
 type SyntheticTargetContext = {
   id: string;
   parentID: string;
@@ -220,6 +228,95 @@ function extractPartTargetSessionCandidates(event: EventLike): string[] {
   return [...candidates];
 }
 
+function parseTaskSessionIDFromOutput(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const match = value.match(/\btask_id\s*:\s*(ses_[a-zA-Z0-9_-]+)/);
+  return match?.[1];
+}
+
+export function extractTaskToolEvidence(event: EventLike): TaskToolEvidence | null {
+  const part = event.properties?.part;
+  if (!isRecord(part) || part.type !== "tool") return null;
+  if (asString(part.tool) !== "task") return null;
+
+  const state = isRecord(part.state) ? part.state : undefined;
+  if (!state) return null;
+
+  const rawStatus = asString(state.status);
+  const status: TaskToolStatus =
+    rawStatus === "completed"
+      ? "done"
+      : rawStatus === "error"
+        ? "error"
+        : "running";
+
+  const metadata = isRecord(state.metadata) ? state.metadata : undefined;
+  const targetFromMetadata = asString(metadata?.sessionId);
+  const targetFromOutput = parseTaskSessionIDFromOutput(state.output);
+  const targetCandidates = extractPartTargetSessionCandidates(event);
+  const targetSessionID =
+    targetFromMetadata ??
+    targetFromOutput ??
+    (targetCandidates.length === 1 ? targetCandidates[0] : undefined);
+
+  const endedAt =
+    status === "done" || status === "error"
+      ? extractEventTimestamp(event, ["completed", "end", "ended", "updated"])
+      : undefined;
+
+  return {
+    status,
+    targetSessionID,
+    endedAt,
+  };
+}
+
+function mapTaskToolToSubtaskID(
+  state: StatuslineState,
+  task: {
+    parentID: string;
+    messageID: string;
+    title: string;
+    summary?: string;
+    agentName?: string;
+    targetSessionID?: string;
+  },
+): string | undefined {
+  const candidates = Object.values(state.children).filter(
+    (child) =>
+      child.source === "subtask" &&
+      child.status === "running" &&
+      child.parentID === task.parentID &&
+      child.messageID === task.messageID,
+  );
+  if (candidates.length === 0) return undefined;
+
+  if (task.targetSessionID) {
+    const byTarget = candidates.filter(
+      (child) => child.targetSessionID === task.targetSessionID,
+    );
+    if (byTarget.length === 1) return byTarget[0].id;
+  }
+
+  const byTitle = candidates.filter((child) =>
+    sameDisplayText(child.title, task.title),
+  );
+  if (byTitle.length === 1) return byTitle[0].id;
+
+  const bySummary = candidates.filter((child) =>
+    sameDisplayText(child.summary, task.summary),
+  );
+  if (bySummary.length === 1) return bySummary[0].id;
+
+  const byAgent = task.agentName
+    ? candidates.filter((child) => sameDisplayText(child.agentName, task.agentName))
+    : [];
+  if (byAgent.length === 1) return byAgent[0].id;
+
+  if (candidates.length === 1) return candidates[0].id;
+  return undefined;
+}
+
 function toIsoTimestamp(value: unknown): string | undefined {
   if (typeof value === "string") {
     if (value.trim().length === 0) return undefined;
@@ -319,13 +416,15 @@ function extractToolChild(event: EventLike): ToolChild | null {
   const state = isRecord(part.state) ? part.state : undefined;
   if (!partID || !parentID || !messageID || !state) return null;
 
+  const taskEvidence = extractTaskToolEvidence(event);
   const rawStatus = asString(state.status);
   const status =
-    rawStatus === "completed"
+    taskEvidence?.status ??
+    (rawStatus === "completed"
       ? "done"
       : rawStatus === "error"
         ? "error"
-        : "running";
+        : "running");
 
   const input = isRecord(state.input) ? state.input : {};
   const description = asString(input.description);
@@ -352,10 +451,12 @@ function extractToolChild(event: EventLike): ToolChild | null {
     startedAt;
   const endedAt =
     status === "done" || status === "error"
-      ? extractEventTimestamp(event, ["completed", "ended", "updated"])
+      ? extractEventTimestamp(event, ["completed", "end", "ended", "updated"])
       : undefined;
   const targetCandidates = extractPartTargetSessionCandidates(event);
-  const targetSessionID = targetCandidates.length === 1 ? targetCandidates[0] : undefined;
+  const targetSessionID =
+    taskEvidence?.targetSessionID ??
+    (targetCandidates.length === 1 ? targetCandidates[0] : undefined);
 
   return {
     id: `tool:${partID}`,
@@ -569,7 +670,7 @@ export function applySubagentEvent(state: StatuslineState, event: unknown): bool
   if (type === "session.idle") {
     const childID = extractSessionID(e);
     if (!childID) return false;
-    const endedAt = extractEventTimestamp(e, ["completed", "ended", "updated"]);
+    const endedAt = extractEventTimestamp(e, ["completed", "end", "ended", "updated"]);
     const details = extractChildDetails(e);
     let changed = markChildStatus(state, childID, "done", endedAt);
     changed = upsertChildDetails(state, childID, details) || changed;
@@ -579,7 +680,7 @@ export function applySubagentEvent(state: StatuslineState, event: unknown): bool
   if (type === "session.error") {
     const childID = extractSessionID(e);
     if (!childID) return false;
-    const endedAt = extractEventTimestamp(e, ["completed", "ended", "updated"]);
+    const endedAt = extractEventTimestamp(e, ["completed", "end", "ended", "updated"]);
     const details = extractChildDetails(e);
     let changed = markChildStatus(state, childID, "error", endedAt);
     changed = upsertChildDetails(state, childID, details) || changed;
@@ -633,6 +734,29 @@ export function applySubagentEvent(state: StatuslineState, event: unknown): bool
         changed =
           markChildStatus(state, tool.id, tool.status, tool.endedAt ?? tool.updatedAt) ||
           changed;
+
+        if (asString((e.properties?.part as Record<string, unknown> | undefined)?.tool) === "task") {
+          const subtaskID = mapTaskToolToSubtaskID(state, {
+            parentID: tool.parentID,
+            messageID: tool.messageID,
+            title: tool.title,
+            summary: tool.summary,
+            agentName: tool.agentName,
+            targetSessionID: targetSessionID,
+          });
+          if (subtaskID) {
+            if (targetSessionID) {
+              changed =
+                upsertChildDetails(state, subtaskID, {
+                  targetSessionID,
+                  updatedAt: tool.updatedAt,
+                }) || changed;
+            }
+            changed =
+              markChildStatus(state, subtaskID, tool.status, tool.endedAt ?? tool.updatedAt) ||
+              changed;
+          }
+        }
       }
     }
   }

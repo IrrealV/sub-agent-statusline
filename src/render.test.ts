@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  byPriority,
   collapseSubagentWorkItems,
   formatContext,
   formatContextCompact,
@@ -29,7 +30,9 @@ function child(overrides: Partial<ChildSessionState> = {}): ChildSessionState {
 
 describe("render", () => {
   it("formats durations and context details semantically", () => {
-    const withTokens = child({ tokens: { input: 1200, output: 300, contextPercent: 12.34 } });
+    const withTokens = child({
+      tokens: { input: 1200, output: 300, contextPercent: 12.34 },
+    });
 
     expect(formatDuration(61000)).toBe("01:01");
     expect(formatDuration(3_661_000)).toBe("01:01:01");
@@ -67,6 +70,44 @@ describe("render", () => {
     ]);
   });
 
+  it("keeps one grouped row and avoids duplicate wrappers", () => {
+    const children: ChildSessionState[] = [
+      child({
+        id: "tool:task-wrapper",
+        title: "task",
+        source: "tool",
+        messageID: "msg_1",
+      }),
+      child({
+        id: "subtask:work_1",
+        title: "Implement grouping assertions",
+        source: "subtask",
+        messageID: "msg_1",
+        targetSessionID: "ses_child_1",
+      }),
+      child({
+        id: "ses_child_1",
+        title: "Implement grouping assertions (coder)",
+        source: "session",
+        messageID: "msg_1",
+        status: "done",
+        color: "green",
+        endedAt: "2026-04-30T12:10:00.000Z",
+        updatedAt: "2026-04-30T12:10:00.000Z",
+      }),
+    ];
+
+    const collapsed = collapseSubagentWorkItems(children);
+
+    expect(collapsed.map((item) => item.id)).toEqual(["subtask:work_1"]);
+    expect(collapsed[0]).toMatchObject({
+      status: "done",
+      color: "green",
+      targetSessionID: "ses_child_1",
+      endedAt: "2026-04-30T12:10:00.000Z",
+    });
+  });
+
   it("keeps recent done items visible and hides stale done items", () => {
     const now = Date.parse("2026-04-30T10:20:00.000Z");
     const visibleDone = child({
@@ -82,16 +123,68 @@ describe("render", () => {
       endedAt: "2026-04-30T10:00:00.000Z",
     });
 
-    expect(visibleSubagentWorkItems([visibleDone, hiddenDone], now).map((item) => item.id)).toEqual([
-      "done_recent",
+    expect(
+      visibleSubagentWorkItems([visibleDone, hiddenDone], now).map((item) => item.id),
+    ).toEqual(["done_recent"]);
+  });
+
+  it("keeps active running work visible and deprioritizes unrelated done rows", () => {
+    const nowMs = Date.parse("2026-04-30T12:15:00.000Z");
+    const children: ChildSessionState[] = [
+      child({
+        id: "subtask:active",
+        title: "Long running active work",
+        source: "subtask",
+        messageID: "msg_active",
+        status: "running",
+      }),
+      child({
+        id: "subtask:active-done",
+        title: "Recent completion in active thread",
+        source: "subtask",
+        messageID: "msg_active",
+        status: "done",
+        color: "green",
+        endedAt: "2026-04-30T12:14:00.000Z",
+        updatedAt: "2026-04-30T12:14:00.000Z",
+      }),
+      child({
+        id: "subtask:historical",
+        title: "Historical completion",
+        source: "subtask",
+        messageID: "msg_old",
+        status: "done",
+        color: "green",
+        endedAt: "2026-04-30T12:14:00.000Z",
+        updatedAt: "2026-04-30T12:14:00.000Z",
+      }),
+    ];
+
+    const visible = visibleSubagentWorkItems(children, nowMs);
+
+    expect(visible.map((item) => item.id)).toEqual([
+      "subtask:active",
+      "subtask:active-done",
     ]);
+    expect(visible.some((item) => item.id === "subtask:historical")).toBe(false);
+  });
+
+  it("sorts ties by id for stable priority", () => {
+    const a = child({ id: "a", startedAt: "2026-04-30T12:00:00.000Z" });
+    const b = child({ id: "b", startedAt: "2026-04-30T12:00:00.000Z" });
+    expect([b, a].sort(byPriority).map((item) => item.id)).toEqual(["a", "b"]);
   });
 
   it("renders aggregate and detail statusline output without color when disabled", () => {
     process.env.NO_COLOR = "1";
     const state: StatuslineState = {
       children: {
-        running: child({ id: "running", title: "Run tests", status: "running", color: "yellow" }),
+        running: child({
+          id: "running",
+          title: "Run tests",
+          status: "running",
+          color: "yellow",
+        }),
         error: child({ id: "error", title: "Fix bug", status: "error", color: "red" }),
       },
       countedChildIDs: { running: true, error: true },

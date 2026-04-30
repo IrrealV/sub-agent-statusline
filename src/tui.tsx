@@ -34,6 +34,16 @@ import {
   visibleSubagentWorkItems,
 } from "./render.js";
 import {
+  capCandidates,
+  hasRecentMessageActivity,
+  nextBackoffState,
+  shouldApplyStaleRunningFallback,
+  shouldSkipCandidateForBackoff,
+  summarizeSessionMessages,
+  type RunningReconcileCacheEntry,
+  type RunningReconcileEvidence,
+} from "./reconcile.js";
+import {
   createEmptyState,
   markChildStatus,
   refreshDerivedFields,
@@ -55,6 +65,13 @@ const DONE_TOKEN_REHYDRATE_MAX_ATTEMPTS = 15;
 const HYDRATE_RETRY_BASE_DELAY_MS = 1000;
 const HYDRATE_RETRY_MAX_DELAY_MS = 30_000;
 const HYDRATE_RETRY_MAX_ATTEMPTS = 6;
+const RUNNING_RECONCILE_MAINTENANCE_INTERVAL_MS = 10 * 60_000;
+const RUNNING_RECONCILE_MAX_CANDIDATES = 8;
+const RUNNING_RECONCILE_INITIAL_BACKOFF_MS = 15_000;
+const RUNNING_RECONCILE_MAX_BACKOFF_MS = 5 * 60_000;
+const RUNNING_RECONCILE_MESSAGE_AGE_GATE_MS = 60_000;
+const RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS = 5 * 60_000;
+const DEFAULT_STALE_RUNNING_THRESHOLD_MS = 24 * 60 * 60_000;
 const CLOCK_ICON = "";
 const TOKEN_ICON = "";
 const SUBAGENTS_EXPANDED_KV_KEY = "subagents.sidebar.expanded";
@@ -98,6 +115,13 @@ interface RehydratedTokenCacheEntry {
   attempts: number;
   checkedAtMs: number;
   tokens?: ChildTokenState;
+}
+
+interface RunningReconcileCandidate {
+  childID: string;
+  targetSessionID: string;
+  startedMs: number;
+  updatedMs: number;
 }
 
 const doneTokenCache = new Map<string, RehydratedTokenCacheEntry>();
@@ -559,6 +583,22 @@ function toFinitePositiveInt(value: unknown): number | undefined {
   const rounded = Math.floor(value);
   return rounded > 0 ? rounded : undefined;
 }
+
+function parseStaleRunningThresholdMs(): number {
+  const raw = process.env.OPENCODE_SUBAGENT_STATUSLINE_STALE_RUNNING_MS;
+  if (typeof raw !== "string" || raw.trim().length === 0) {
+    return DEFAULT_STALE_RUNNING_THRESHOLD_MS;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_STALE_RUNNING_THRESHOLD_MS;
+  }
+
+  return Math.floor(parsed);
+}
+
+const STALE_RUNNING_THRESHOLD_MS = parseStaleRunningThresholdMs();
 
 function resolveSidebarWidth(ctx: unknown): number | undefined {
   const source = asRecord(ctx);
@@ -1195,7 +1235,7 @@ async function hydratePreviousSubagents(
           : [];
         return {
           childID,
-          ...summarizeAssistantMessages(childMessages),
+          ...summarizeSessionMessages(childMessages),
           fetchFailed,
         };
       }),
@@ -1398,52 +1438,6 @@ function deriveSessionChildStatus(
   return undefined;
 }
 
-function summarizeAssistantMessages(messages: unknown[]): {
-  completedAt?: string;
-  evidenceAt?: string;
-  hasError: boolean;
-} {
-  let completedAt: string | undefined;
-  let evidenceAt: string | undefined;
-  let hasError = false;
-  const assistantMessages = messages
-    .map((rawMessage) => asRecord(rawMessage))
-    .map((message) => asRecord(message?.info))
-    .filter(
-      (info): info is Record<string, unknown> => info?.role === "assistant",
-    )
-    .sort((left, right) => messageTimeMillis(left) - messageTimeMillis(right));
-
-  for (const info of assistantMessages) {
-    const time = asRecord(info.time);
-    const candidate = timestampFromUnknown(time?.completed);
-    const errorAt =
-      timestampFromUnknown(time?.updated) ??
-      timestampFromUnknown(time?.completed) ??
-      timestampFromUnknown(time?.created);
-    if (info.error) {
-      hasError = true;
-      evidenceAt = errorAt ?? evidenceAt;
-    } else if (candidate) {
-      completedAt = candidate;
-      evidenceAt = candidate;
-      hasError = false;
-    }
-  }
-
-  return { completedAt, evidenceAt, hasError };
-}
-
-function messageTimeMillis(info: Record<string, unknown> | undefined): number {
-  const time = asRecord(info?.time);
-  return (
-    timestampMillisFromUnknown(time?.completed) ??
-    timestampMillisFromUnknown(time?.updated) ??
-    timestampMillisFromUnknown(time?.created) ??
-    0
-  );
-}
-
 function sessionTimestamp(
   session: Record<string, unknown>,
   key: string,
@@ -1470,6 +1464,186 @@ function timestampMillisFromUnknown(value: unknown): number | undefined {
   return undefined;
 }
 
+function resolveRouteSessionID(api: TuiPluginApi): string | undefined {
+  return api.route.current.name === "session" &&
+    typeof api.route.current.params?.sessionID === "string"
+    ? api.route.current.params.sessionID
+    : undefined;
+}
+
+function resolveRunningChildAgeMillis(child: ChildSessionState, nowMs: number): {
+  startedMs: number;
+  updatedMs: number;
+} {
+  const startedMs = Date.parse(child.startedAt);
+  const updatedMs = Date.parse(child.updatedAt);
+  return {
+    startedMs: Number.isNaN(startedMs) ? 0 : Math.max(0, nowMs - startedMs),
+    updatedMs: Number.isNaN(updatedMs) ? 0 : Math.max(0, nowMs - updatedMs),
+  };
+}
+
+function resolveReconcileTargetSessionID(
+  state: StatuslineState,
+  child: ChildSessionState,
+): string | undefined {
+  return resolveChildTargetSessionID(child) ??
+    resolveSyntheticTargetFromHydratedState(state, child);
+}
+
+function selectRunningReconcileCandidates(input: {
+  state: StatuslineState;
+  currentSessionID?: string;
+  nowMs: number;
+  maxCandidates: number;
+}): RunningReconcileCandidate[] {
+  const runningChildren = Object.values(input.state.children).filter(
+    (child) => child.status === "running",
+  );
+  if (runningChildren.length === 0) return [];
+
+  const prioritized = visibleSubagentWorkItems(
+    runningChildren,
+    input.nowMs,
+  ).sort(byPriority);
+  const prioritizedForSession = prioritized.filter((child) =>
+    input.currentSessionID ? child.parentID === input.currentSessionID : true,
+  );
+
+  const veryOldIDs = new Set(
+    runningChildren
+      .filter((child) => {
+        const age = resolveRunningChildAgeMillis(child, input.nowMs);
+        return (
+          age.startedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS ||
+          age.updatedMs >= RUNNING_RECONCILE_OLD_CANDIDATE_AGE_MS
+        );
+      })
+      .map((child) => child.id),
+  );
+
+  const ordered = [
+    ...prioritizedForSession,
+    ...runningChildren.filter((child) => veryOldIDs.has(child.id)),
+  ];
+
+  const selected: RunningReconcileCandidate[] = [];
+  const seen = new Set<string>();
+  for (const child of ordered) {
+    if (seen.has(child.id)) continue;
+    seen.add(child.id);
+    const targetSessionID = resolveReconcileTargetSessionID(input.state, child);
+    if (!targetSessionID) continue;
+    const age = resolveRunningChildAgeMillis(child, input.nowMs);
+    selected.push({
+      childID: child.id,
+      targetSessionID,
+      startedMs: age.startedMs,
+      updatedMs: age.updatedMs,
+    });
+    if (selected.length >= input.maxCandidates) break;
+  }
+
+  return capCandidates(selected, input.maxCandidates);
+}
+
+async function probeRunningEvidence(input: {
+  api: TuiPluginApi;
+  targetSessionID: string;
+  directory: string;
+  candidateAgeMs: number;
+  nowMs: number;
+}): Promise<RunningReconcileEvidence> {
+  let probeFailed = false;
+
+  const directStatus = safeRead(() =>
+    input.api.state.session.status(input.targetSessionID),
+  );
+  if (directStatus === undefined) probeFailed = true;
+  const statusFromState = deriveSessionChildStatus(asRecord(directStatus));
+  if (statusFromState === "done" || statusFromState === "error") {
+    return { status: statusFromState, endedAt: new Date().toISOString() };
+  }
+  if (statusFromState === "running") {
+    return { status: "running", sawRunningEvidence: true };
+  }
+
+  const statusResp = await safeReadAsync(() =>
+    input.api.client.session.status({ directory: input.directory }),
+  );
+  if (statusResp === undefined) probeFailed = true;
+  const statuses = asRecord(statusResp?.data);
+  const statusFromClient = deriveSessionChildStatus(
+    asRecord(statuses?.[input.targetSessionID]),
+  );
+  if (statusFromClient === "done" || statusFromClient === "error") {
+    return { status: statusFromClient, endedAt: new Date().toISOString() };
+  }
+  if (statusFromClient === "running") {
+    return { status: "running", sawRunningEvidence: true };
+  }
+
+  if (input.candidateAgeMs < RUNNING_RECONCILE_MESSAGE_AGE_GATE_MS) {
+    return { probeFailed, canApplyStaleFallback: false };
+  }
+
+  const messagesResp = await safeReadAsync(() =>
+    input.api.client.session.messages({
+      sessionID: input.targetSessionID,
+      directory: input.directory,
+    }),
+  );
+  if (messagesResp === undefined || !Array.isArray(messagesResp?.data)) {
+    return {
+      checkedMessages: false,
+      probeFailed: true,
+      canApplyStaleFallback: false,
+    };
+  }
+  const messages = Array.isArray(messagesResp?.data) ? messagesResp.data : [];
+  const summary = summarizeSessionMessages(messages);
+
+  if (summary.hasError) {
+    return {
+      status: "error",
+      endedAt: summary.evidenceAt,
+      checkedMessages: true,
+      canApplyStaleFallback: false,
+    };
+  }
+
+  if (typeof summary.completedAt === "string") {
+    return {
+      status: "done",
+      endedAt: summary.completedAt,
+      checkedMessages: true,
+      canApplyStaleFallback: false,
+    };
+  }
+
+  if (
+    hasRecentMessageActivity({
+      nowMs: input.nowMs,
+      latestMessageActivityAtMs: summary.latestMessageActivityAtMs,
+      staleThresholdMs: STALE_RUNNING_THRESHOLD_MS,
+    })
+  ) {
+    return {
+      checkedMessages: true,
+      sawRunningEvidence: true,
+      endedAt: summary.latestMessageActivityAt,
+      probeFailed,
+      canApplyStaleFallback: false,
+    };
+  }
+
+  return {
+    checkedMessages: true,
+    probeFailed,
+    canApplyStaleFallback: !probeFailed,
+  };
+}
+
 const tui: TuiPlugin = async (api: TuiPluginApi) => {
   const statePath = resolveStatePath();
   const textPath = resolveTextPath(statePath);
@@ -1494,6 +1668,9 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     api.kv.get<boolean>(SUBAGENTS_SECTION_ENABLED_KV_KEY, true) !== false,
   );
   const hydrateRetryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+  const runningReconcileBackoff = new Map<string, RunningReconcileCacheEntry>();
+  let reconcileInFlight = false;
+  let lastRunningReconcileAtMs = 0;
   let disposed = false;
   let previousRouteSessionID: string | undefined;
 
@@ -1558,10 +1735,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   createEffect(() => {
     hydrateRetryTick();
     const route = api.route.current;
-    const routeSessionID =
-      route.name === "session" && typeof route.params?.sessionID === "string"
-        ? route.params.sessionID
-        : undefined;
+    const routeSessionID = resolveRouteSessionID(api);
 
     if (previousRouteSessionID && previousRouteSessionID !== routeSessionID) {
       resetHydrateRetry(previousRouteSessionID);
@@ -1667,8 +1841,16 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
   });
 
   const tick = setInterval(() => {
+    const currentNowMs = Date.now();
+    const shouldRunReconcileMaintenance =
+      currentNowMs - lastRunningReconcileAtMs >=
+      RUNNING_RECONCILE_MAINTENANCE_INTERVAL_MS;
+    if (shouldRunReconcileMaintenance) {
+      void reconcileRunningChildren();
+    }
+
     snapshotSidebarScrollOffsets();
-    setNowMs(Date.now());
+    setNowMs(currentNowMs);
     setState((current: StatuslineState) => {
       const next = cloneState(current);
       const hydrated = hydrateStateTokensFromTuiState(api, next);
@@ -1678,6 +1860,119 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
       return next;
     });
   }, ELAPSED_TICK_MS);
+
+  const reconcileRunningChildren = async (): Promise<void> => {
+    if (reconcileInFlight || disposed) return;
+    reconcileInFlight = true;
+    lastRunningReconcileAtMs = Date.now();
+
+    try {
+      const snapshot = cloneState(state());
+      const nowMs = Date.now();
+      const currentSessionID = resolveRouteSessionID(api);
+      const directory = api.state.path.directory;
+
+      const selected = selectRunningReconcileCandidates({
+        state: snapshot,
+        currentSessionID,
+        nowMs,
+        maxCandidates: RUNNING_RECONCILE_MAX_CANDIDATES,
+      });
+
+      const mutations: Array<{
+        targetSessionID: string;
+        status: "done" | "error";
+        endedAt?: string;
+      }> = [];
+
+      for (const candidate of selected) {
+        const key = candidate.targetSessionID;
+        const cache = runningReconcileBackoff.get(key);
+        if (shouldSkipCandidateForBackoff(cache, nowMs)) continue;
+
+        const evidence = await probeRunningEvidence({
+          api,
+          targetSessionID: candidate.targetSessionID,
+          directory,
+          candidateAgeMs: Math.max(candidate.startedMs, candidate.updatedMs),
+          nowMs,
+        });
+
+        if (evidence.status === "done" || evidence.status === "error") {
+          mutations.push({
+            targetSessionID: candidate.targetSessionID,
+            status: evidence.status,
+            endedAt: evidence.endedAt,
+          });
+          runningReconcileBackoff.delete(key);
+          continue;
+        }
+
+        if (evidence.sawRunningEvidence) {
+          runningReconcileBackoff.set(key, {
+            backoffMs: RUNNING_RECONCILE_INITIAL_BACKOFF_MS,
+            nextAllowedAtMs: nowMs + RUNNING_RECONCILE_INITIAL_BACKOFF_MS,
+          });
+          continue;
+        }
+
+        const shouldApplyFallback = shouldApplyStaleRunningFallback({
+          staleThresholdMs: STALE_RUNNING_THRESHOLD_MS,
+          evidence,
+          startedMs: candidate.startedMs,
+          updatedMs: candidate.updatedMs,
+        });
+
+        if (shouldApplyFallback) {
+          mutations.push({
+            targetSessionID: candidate.targetSessionID,
+            status: "done",
+            endedAt: new Date(nowMs - candidate.updatedMs).toISOString(),
+          });
+          runningReconcileBackoff.delete(key);
+          continue;
+        }
+
+        runningReconcileBackoff.set(
+          key,
+          nextBackoffState({
+            cache,
+            nowMs,
+            initialBackoffMs: RUNNING_RECONCILE_INITIAL_BACKOFF_MS,
+            maxBackoffMs: RUNNING_RECONCILE_MAX_BACKOFF_MS,
+          }),
+        );
+      }
+
+      if (mutations.length === 0) return;
+
+      snapshotSidebarScrollOffsets();
+      setState((current: StatuslineState) => {
+        const next = cloneState(current);
+        let changed = false;
+
+        for (const mutation of mutations) {
+          if (
+            markChildStatus(
+              next,
+              mutation.targetSessionID,
+              mutation.status,
+              mutation.endedAt,
+            )
+          ) {
+            changed = true;
+          }
+        }
+
+        const refreshed = refreshLiveState(next);
+        if (!changed && !refreshed) return current;
+        persistStateSnapshot(statePath, textPath, next);
+        return next;
+      });
+    } finally {
+      reconcileInFlight = false;
+    }
+  };
 
   const applyEvent = (event: unknown): void => {
     debugEvent(event);
@@ -1731,11 +2026,7 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
     order: 90,
     slots: {
       sidebar_content(ctx: SidebarContentContext) {
-        const routeSessionID =
-          api.route.current.name === "session" &&
-          typeof api.route.current.params?.sessionID === "string"
-            ? api.route.current.params.sessionID
-            : undefined;
+        const routeSessionID = resolveRouteSessionID(api);
         const sessionID = ctx.session_id ?? routeSessionID ?? "";
         debugLog({
           kind: "slot.sidebar_content",
