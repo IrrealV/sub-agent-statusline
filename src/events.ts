@@ -25,8 +25,10 @@ export type EventLike = {
       role?: unknown;
       time?: unknown;
     };
+    parentID?: unknown;
     part?: unknown;
   };
+  parentID?: unknown;
   [key: string]: unknown;
 };
 
@@ -276,19 +278,26 @@ function mapTaskToolToSubtaskID(
   task: {
     parentID: string;
     messageID: string;
+    parentMessageID?: string;
     title: string;
     summary?: string;
     agentName?: string;
     targetSessionID?: string;
   },
 ): string | undefined {
-  const candidates = Object.values(state.children).filter(
+  const runningSubtasks = Object.values(state.children).filter(
     (child) =>
       child.source === "subtask" &&
       child.status === "running" &&
-      child.parentID === task.parentID &&
-      child.messageID === task.messageID,
+      child.parentID === task.parentID,
   );
+  const primaryCandidates = runningSubtasks.filter(
+    (child) => child.messageID === task.messageID,
+  );
+  const legacyCandidates = task.parentMessageID
+    ? runningSubtasks.filter((child) => child.messageID === task.parentMessageID)
+    : [];
+  const candidates = primaryCandidates.length > 0 ? primaryCandidates : legacyCandidates;
   if (candidates.length === 0) return undefined;
 
   if (task.targetSessionID) {
@@ -315,6 +324,14 @@ function mapTaskToolToSubtaskID(
 
   if (candidates.length === 1) return candidates[0].id;
   return undefined;
+}
+
+function extractParentMessageID(event: EventLike): string | undefined {
+  return (
+    asString(event.properties?.info?.parentID) ??
+    asString(event.properties?.parentID) ??
+    asString(event.parentID)
+  );
 }
 
 function toIsoTimestamp(value: unknown): string | undefined {
@@ -739,6 +756,7 @@ export function applySubagentEvent(state: StatuslineState, event: unknown): bool
           const subtaskID = mapTaskToolToSubtaskID(state, {
             parentID: tool.parentID,
             messageID: tool.messageID,
+            parentMessageID: extractParentMessageID(e),
             title: tool.title,
             summary: tool.summary,
             agentName: tool.agentName,
