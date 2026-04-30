@@ -3,6 +3,7 @@ import {
   capCandidates,
   hasRecentMessageActivity,
   nextBackoffState,
+  resolvePersistedStaleSubtaskFromParentMessages,
   shouldApplyStaleRunningFallback,
   shouldSkipCandidateForBackoff,
   summarizeSessionMessages,
@@ -127,5 +128,79 @@ describe("candidate cap and backoff", () => {
       maxBackoffMs: 300_000,
     });
     expect(doubled.backoffMs).toBe(30_000);
+  });
+});
+
+describe("persisted stale subtask recovery evidence", () => {
+  const stale = {
+    childID: "subtask:prt_ddea56110001RtlmRJFV99PmiU",
+    parentID: "ses_2215a9f08ffewGBrk9aJ973lCD",
+    messageID: "msg_ddea560fd001mnSF0ssrplOLZq",
+    title: "Execute subtask",
+  };
+
+  it("resolves terminal task evidence from parent assistant message parentID", () => {
+    const result = resolvePersistedStaleSubtaskFromParentMessages({
+      candidate: stale,
+      messages: [
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_ddea560fd001mnSF0ssrplOLZq",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                metadata: { sessionId: "ses_2215a9eceffelCOOb8v66cT2v0" },
+                time: { end: "2026-04-30T12:20:00.000Z" },
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result).toEqual({
+      status: "done",
+      targetSessionID: "ses_2215a9eceffelCOOb8v66cT2v0",
+      endedAt: "2026-04-30T12:20:00.000Z",
+    });
+  });
+
+  it("fails closed when evidence is ambiguous", () => {
+    const result = resolvePersistedStaleSubtaskFromParentMessages({
+      candidate: stale,
+      messages: [
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_ddea560fd001mnSF0ssrplOLZq",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                metadata: { sessionId: "ses_1" },
+              },
+            },
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "error",
+                output: "task_id: ses_2",
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result).toBeUndefined();
   });
 });
