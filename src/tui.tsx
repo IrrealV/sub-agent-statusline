@@ -37,6 +37,7 @@ import {
   visibleSubagentWorkItems,
 } from "./render.js";
 import {
+  canSafelyCloseNoTargetPersistedCandidate,
   capCandidates,
   hasRecentMessageActivity,
   nextBackoffState,
@@ -1606,7 +1607,13 @@ async function hydratePreviousSubagents(
         const parentMessageID = messageIDOf(message);
         const isAssistant = info?.role === "assistant";
         const time = asRecord(info?.time);
-        const eventInfo = time ? { time } : undefined;
+        const eventInfo = {
+          id: typeof info?.id === "string" ? info.id : undefined,
+          role: typeof info?.role === "string" ? info.role : undefined,
+          parentID:
+            typeof info?.parentID === "string" ? info.parentID : undefined,
+          time,
+        };
         const completedAt = timestampFromUnknown(time?.completed);
         const isCompleted = typeof completedAt === "string";
         const hasError = !!info?.error;
@@ -2285,6 +2292,8 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
         reconcileWithoutTargetSessionID?: boolean;
       }> = [];
 
+      const parentMessagesCache = new Map<string, unknown[] | null>();
+
       for (const candidate of selected) {
         const key = candidate.targetSessionID ?? candidate.childID;
         const cache = runningReconcileBackoff.get(key);
@@ -2299,13 +2308,21 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
             candidate.messageID.length > 0;
           if (!isPersistedSubtaskCandidate) continue;
 
-          const parentMessagesResp = await safeReadAsync(() =>
-            api.client.session.messages({
-              sessionID: candidate.parentID as string,
-              directory,
-            }),
-          );
-          if (parentMessagesResp === undefined || !Array.isArray(parentMessagesResp?.data)) {
+          const parentSessionID = candidate.parentID as string;
+          let parentMessages = parentMessagesCache.get(parentSessionID);
+          if (parentMessages === undefined) {
+            const parentMessagesResp = await safeReadAsync(() =>
+              api.client.session.messages({
+                sessionID: parentSessionID,
+                directory,
+              }),
+            );
+            parentMessages = Array.isArray(parentMessagesResp?.data)
+              ? parentMessagesResp.data
+              : null;
+            parentMessagesCache.set(parentSessionID, parentMessages);
+          }
+          if (parentMessages === null) {
             runningReconcileBackoff.set(
               key,
               nextBackoffState({
@@ -2327,9 +2344,31 @@ const tui: TuiPlugin = async (api: TuiPluginApi) => {
               summary: candidate.summary,
               agentName: candidate.agentName,
             } satisfies PersistedStaleSubtaskCandidate,
-            messages: parentMessagesResp.data,
+            messages: parentMessages,
           });
           if (!evidence) {
+            const parentSummary = summarizeSessionMessages(parentMessages);
+            const canSafelyFallbackByParentInactivity =
+              canSafelyCloseNoTargetPersistedCandidate({
+                nowMs,
+                staleThresholdMs: STALE_RUNNING_THRESHOLD_MS,
+                startedMs: candidate.startedMs,
+                updatedMs: candidate.updatedMs,
+                latestMessageActivityAtMs: parentSummary.latestMessageActivityAtMs,
+              });
+            if (canSafelyFallbackByParentInactivity) {
+              mutations.push({
+                childID: candidate.childID,
+                targetSessionID: candidate.childID,
+                status: "done",
+                endedAt:
+                  parentSummary.latestMessageActivityAt ??
+                  new Date(nowMs - candidate.updatedMs).toISOString(),
+                reconcileWithoutTargetSessionID: true,
+              });
+              runningReconcileBackoff.delete(key);
+              continue;
+            }
             runningReconcileBackoff.set(
               key,
               nextBackoffState({

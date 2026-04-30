@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  canSafelyCloseNoTargetPersistedCandidate,
   capCandidates,
   hasRecentMessageActivity,
   nextBackoffState,
@@ -202,5 +203,134 @@ describe("persisted stale subtask recovery evidence", () => {
     });
 
     expect(result).toBeUndefined();
+  });
+
+  it("prefers parent-message linkage with metadata tie-breakers", () => {
+    const result = resolvePersistedStaleSubtaskFromParentMessages({
+      candidate: {
+        ...stale,
+        summary: "Execute subtask for auth migration",
+        agentName: "code",
+      },
+      messages: [
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_ddea560fd001mnSF0ssrplOLZq",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: { prompt: "Execute subtask for auth migration" },
+                metadata: { sessionId: "ses_good_target" },
+              },
+            },
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: { prompt: "something else" },
+                metadata: { sessionId: "ses_other_target" },
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result).toEqual({
+      status: "done",
+      targetSessionID: "ses_good_target",
+      endedAt: undefined,
+    });
+  });
+
+  it("does not match by generic title and agent alone", () => {
+    const result = resolvePersistedStaleSubtaskFromParentMessages({
+      candidate: {
+        ...stale,
+        title: "Execute subtask",
+        summary: undefined,
+        agentName: "code",
+      },
+      messages: [
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_unrelated",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: { description: "Execute subtask", subagent_type: "code" },
+                output: "task_id: ses_should_not_match",
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result).toBeUndefined();
+  });
+
+  it("accepts output task_id with underscores and dashes", () => {
+    const result = resolvePersistedStaleSubtaskFromParentMessages({
+      candidate: stale,
+      messages: [
+        {
+          info: {
+            role: "assistant",
+            parentID: "msg_ddea560fd001mnSF0ssrplOLZq",
+          },
+          parts: [
+            {
+              type: "tool",
+              tool: "task",
+              state: {
+                status: "completed",
+                output: "delegate finished; task_id: ses_child-01_abc",
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result?.targetSessionID).toBe("ses_child-01_abc");
+  });
+});
+
+describe("no-target persisted stale fallback safety", () => {
+  it("allows closure only when stale and with no recent parent activity", () => {
+    const nowMs = Date.now();
+    const staleThresholdMs = 24 * 60 * 60_000;
+
+    expect(
+      canSafelyCloseNoTargetPersistedCandidate({
+        nowMs,
+        staleThresholdMs,
+        startedMs: staleThresholdMs + 1,
+        updatedMs: staleThresholdMs + 1,
+        latestMessageActivityAtMs: nowMs - staleThresholdMs - 1,
+      }),
+    ).toBe(true);
+
+    expect(
+      canSafelyCloseNoTargetPersistedCandidate({
+        nowMs,
+        staleThresholdMs,
+        startedMs: staleThresholdMs + 1,
+        updatedMs: staleThresholdMs + 1,
+        latestMessageActivityAtMs: nowMs - 1_000,
+      }),
+    ).toBe(false);
   });
 });
