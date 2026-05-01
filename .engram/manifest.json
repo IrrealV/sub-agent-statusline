@@ -32,6 +32,14 @@
       "sessions": 52,
       "memories": 179,
       "prompts": 313
+    },
+    {
+      "id": "27821f86",
+      "created_by": "IrrealDev",
+      "created_at": "2026-05-01T08:11:40Z",
+      "sessions": 0,
+      "memories": 0,
+      "prompts": 1
     }
   ]
 }
