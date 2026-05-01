@@ -16,6 +16,14 @@
       "sessions": 32,
       "memories": 120,
       "prompts": 220
+    },
+    {
+      "id": "7320966f",
+      "created_by": "joaquinvesapa",
+      "created_at": "2026-05-01T02:35:17Z",
+      "sessions": 51,
+      "memories": 179,
+      "prompts": 310
     }
   ]
 }
